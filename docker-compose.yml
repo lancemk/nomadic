@@ -1,0 +1,23 @@
+services:
+  postgres:
+    build:
+      context: ./containers/postgres
+      dockerfile: Dockerfile
+    container_name: nomadic-postgres
+    environment:
+      POSTGRES_DB: nomadic
+      POSTGRES_USER: nomadic
+      POSTGRES_PASSWORD: nomadic
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+    volumes:
+      - nomadic_postgres_data:/var/lib/postgresql/data
+
+volumes:
+  nomadic_postgres_data:

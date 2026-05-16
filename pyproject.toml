@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nomadic"
+version = "0.1.0"
+description = "An open-anything inspried Multi-purpose Working Layer—specifci of Agentic Orchetration and Metrics Monitoring all in one place"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "mlx-vlm>=0.4.4",
+    "prompt-toolkit>=3.0.52",
+    "psycopg>=3.2.0",
+    "requests>=2.32.0",
+    "rich>=14.3.3",
+]
+
+[project.scripts]
+nomadic = "nomadic.cli:main"
+nomadic-db = "nomadic.db:main"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["nomadic*"]
+
+[tool.setuptools.package-data]
+nomadic = ["sql/*.sql"]

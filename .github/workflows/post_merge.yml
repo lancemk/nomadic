@@ -1,0 +1,114 @@
+name: Post-Merge Version and Changelog
+
+on:
+  pull_request:
+    branches:
+      - main
+      - "develop/**"
+    types:
+      - closed
+
+permissions:
+  contents: write
+  pull-requests: read
+
+concurrency:
+  group: post-merge-${{ github.event.pull_request.base.ref }}
+  cancel-in-progress: false
+
+jobs:
+  update-release-metadata:
+    if: github.event.pull_request.merged == true && github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout base branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.base.ref }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Fetch PR commits from GitHub API
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/commits?per_page=250" > pr-commits-api.json
+          python - <<'PY'
+          import json
+          import pathlib
+
+          raw_items = json.loads(pathlib.Path("pr-commits-api.json").read_text(encoding="utf-8"))
+          commits = [
+              {
+                  "sha": item["sha"],
+                  "subject": item["commit"]["message"].splitlines()[0].strip(),
+              }
+              for item in raw_items
+          ]
+          pathlib.Path("pr-commits.json").write_text(json.dumps(commits, indent=2) + "\n", encoding="utf-8")
+          PY
+
+      - name: Collect merged PR commits
+        run: |
+          python scripts/collect_commits.py \
+            --base-branch "${{ github.event.pull_request.base.ref }}" \
+            --merge-sha "${{ github.event.pull_request.merge_commit_sha }}" \
+            --pr-number "${{ github.event.pull_request.number }}" \
+            --pr-title "${{ github.event.pull_request.title }}" \
+            --repo-root . \
+            --changelog CHANGELOG.md \
+            --commits-file pr-commits.json \
+            --output post-merge-commits.json
+
+      - name: Read bump recommendation
+        id: bump
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import pathlib
+
+          payload = json.loads(pathlib.Path("post-merge-commits.json").read_text(encoding="utf-8"))
+          with pathlib.Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as handle:
+              handle.write(f"supported_branch={'true' if payload['supported_branch'] else 'false'}\n")
+              handle.write(f"already_recorded={'true' if payload['already_recorded'] else 'false'}\n")
+              handle.write(f"bump={payload['bump']}\n")
+              handle.write(f"commit_count={payload['commit_count']}\n")
+          PY
+
+      - name: Stop for unsupported or already-recorded PR
+        if: steps.bump.outputs.supported_branch != 'true' || steps.bump.outputs.already_recorded == 'true' || steps.bump.outputs.commit_count == '0'
+        run: echo "No release metadata mutation required for this merged PR."
+
+      - name: Bump package version
+        if: steps.bump.outputs.supported_branch == 'true' && steps.bump.outputs.already_recorded != 'true' && steps.bump.outputs.commit_count != '0'
+        id: version
+        run: |
+          NEXT_VERSION="$(python scripts/bump_version.py --pyproject pyproject.toml --bump "${{ steps.bump.outputs.bump }}")"
+          echo "next_version=${NEXT_VERSION}" >> "${GITHUB_OUTPUT}"
+
+      - name: Append changelog entry
+        if: steps.bump.outputs.supported_branch == 'true' && steps.bump.outputs.already_recorded != 'true' && steps.bump.outputs.commit_count != '0'
+        run: |
+          python scripts/append_changelog.py \
+            --changelog CHANGELOG.md \
+            --commits-json post-merge-commits.json \
+            --version "${{ steps.version.outputs.next_version }}" \
+            --date "$(date -u +%F)"
+
+      - name: Commit version and changelog
+        if: steps.bump.outputs.supported_branch == 'true' && steps.bump.outputs.already_recorded != 'true' && steps.bump.outputs.commit_count != '0'
+        run: |
+          if git diff --quiet -- pyproject.toml CHANGELOG.md; then
+            echo "No version or changelog changes to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add pyproject.toml CHANGELOG.md
+          git commit -m "chore(release): bump version after PR #${{ github.event.pull_request.number }} [skip ci]"
+          git push origin "HEAD:${{ github.event.pull_request.base.ref }}"

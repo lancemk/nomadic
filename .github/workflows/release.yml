@@ -1,0 +1,73 @@
+name: Publish Release
+
+on:
+  workflow_run:
+    workflows:
+      - Build Bundles
+    types:
+      - completed
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  release:
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download build artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh run download ${{ github.event.workflow_run.id }} --dir workflow-artifacts
+
+      - name: Load release metadata
+        id: meta
+        run: |
+          python - <<'PY'
+          import json
+          import pathlib
+          import os
+
+          matches = list(pathlib.Path("workflow-artifacts").rglob("release-metadata.json"))
+          if not matches:
+              raise SystemExit("release-metadata.json not found in downloaded artifacts")
+
+          payload = json.loads(matches[0].read_text(encoding="utf-8"))
+          output_path = pathlib.Path(os.environ["GITHUB_OUTPUT"])
+          with output_path.open("a", encoding="utf-8") as handle:
+              handle.write(f"is_tag={'true' if payload['is_tag'] else 'false'}\n")
+              handle.write(f"tag_name={payload['tag_name']}\n")
+              handle.write(f"version={payload['version']}\n")
+          PY
+
+      - name: Skip non-tag build
+        if: steps.meta.outputs.is_tag != 'true'
+        run: echo "Build run was not created from a tag. Skipping release publication."
+
+      - name: Collect bundle paths
+        if: steps.meta.outputs.is_tag == 'true'
+        run: find workflow-artifacts -type f -name 'nomadic-*.tar.gz' | sort > release-files.txt
+
+      - name: Create or update GitHub Release
+        if: steps.meta.outputs.is_tag == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.meta.outputs.tag_name }}
+        run: |
+          if ! test -s release-files.txt; then
+            echo "No bundle artifacts were found."
+            exit 1
+          fi
+
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            echo "Release ${RELEASE_TAG} already exists; uploading artifacts with --clobber."
+          else
+            gh release create "${RELEASE_TAG}" \
+              --title "${RELEASE_TAG}" \
+              --notes "Automated release bundle publication for ${RELEASE_TAG}."
+          fi
+
+          while IFS= read -r file_path; do
+            gh release upload "${RELEASE_TAG}" "${file_path}" --clobber
+          done < release-files.txt

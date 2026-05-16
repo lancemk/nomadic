@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nomadic"
-version = "0.1.0"
+version = "0.1.1"
 description = "An open-anything inspried Multi-purpose Working Layer—specifci of Agentic Orchetration and Metrics Monitoring all in one place"
 readme = "README.md"
 requires-python = ">=3.14"

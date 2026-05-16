@@ -236,6 +236,29 @@ The config-backed default lives at:
 
 You can still override the backend per run with CLI flags.
 
+## CI/CD and Releases
+
+The repository now includes a GitHub Actions release layer built around four workflows:
+
+- `CI`: validate imports, unit tests, and package buildability for PRs into `main` and `develop/*`
+- `Build Bundles`: create macOS and Linux release archives as GitHub Actions artifacts for tags
+- `Post-Merge Version and Changelog`: bump semantic version and append changelog entry after merged PRs into `main` and `develop/*`
+- `Publish Release`: attach built archives to a GitHub Release when a version tag is pushed
+
+Branch behavior:
+
+- PRs targeting `main` and `develop/*` run validation without mutating tracked files
+- only merged PRs into `main` and `develop/*` can mutate `pyproject.toml` and `CHANGELOG.md`
+- tags matching `v*` trigger release publication
+
+Release bundle behavior:
+
+- artifacts are produced for `macos-arm64` and `linux-x86_64`
+- the bundle name format is `nomadic-<version>-<platform>.tar.gz`
+- each bundle includes the installable package artifacts, docs, license file, changelog, and SQL assets
+
+Linux artifacts are currently provided as CI/release deliverables for packaging and roadmap preparation. They do not change the current product support boundary: Apple Silicon remains the only supported runtime target today.
+
 ## Context Management
 
 The REPL includes automatic context compression.

@@ -52,6 +52,10 @@ MANIFEST
 *.manifest
 *.spec
 
+# nomadic release build scratch (scripts/build_bundle.sh)
+/artifacts/
+/.bundle-tmp/
+
 # Installer logs
 pip-log.txt
 pip-delete-this-directory.txt
@@ -81,7 +85,15 @@ local_settings.py
 db.sqlite3
 db.sqlite3-journal
 *.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
 saved/
+
+# nomadic session dumps
+kernel_session_*.json
+
+# macOS
+.DS_Store
 
 # Flask stuff:
 instance/
@@ -240,4 +252,5 @@ __marimo__/
 .streamlit/secrets.toml
 
 # local-first agent
+specs/
 .sovai

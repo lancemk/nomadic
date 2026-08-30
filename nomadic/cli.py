@@ -309,6 +309,20 @@ def is_text_only_model(model_path: str) -> bool:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# KNOWN MODELS  (candidates offered by `/model` with no arguments)
+# ══════════════════════════════════════════════════════════════════════════════
+
+KNOWN_MODELS: list[tuple[str, str]] = [
+    ("mlx-community/gemma-4-26b-a4b-it-4bit", "best stable so far, on local"),
+    ("mlx-community/gemma-4-12B-bf16", "caution: prone to loops"),
+    ("mlx-community/gpt-oss-20b-MXFP4-Q8", ""),
+    ("mlx-community/Qwen-AgentWorld-35B-A3B-bf16", "caution: needs ~70GB RAM, OOMs on 48GB machines"),
+    ("mlx-community/Qwen3.5-27B-Claude-4.6-Opus-Distilled-MLX-4bit", ""),
+    ("mlx-community/Qwen3.6-40B-Claude-4.6-Opus-Deckard-Heretic-Uncensored-Thinking-8bit", ""),
+]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # SERVER CONFIG  (mlx_vlm.server inline params)
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1275,7 +1289,21 @@ def vlm_complete(
         resp = requests.post(url, json=payload, timeout=120)
         resp.raise_for_status()
         data = resp.json()
-        full_reply = data["choices"][0]["message"]["content"]
+        message = data["choices"][0]["message"]
+        content = message.get("content")
+        if content is None:
+            hint = (
+                "If you just switched models with /model, restart `nomadic serve` "
+                "first — the running server keeps serving whatever model it was "
+                "started with until it's restarted."
+            )
+            if message.get("tool_calls"):
+                raise RuntimeError(
+                    f"Model returned native tool_calls with no text content, which "
+                    f"nomadic's structured tool-calling loop does not consume. {hint}"
+                )
+            raise RuntimeError(f"Model server returned an empty response (content was null). {hint}")
+        full_reply = content
 
     return full_reply
 
@@ -2285,9 +2313,26 @@ def cmd_kernel(
                         ui.warn("No active session loaded.")
 
                 elif cmd == "/model":
-                    if rest:
-                        cfg.model = rest.strip()
-                        ui.success(f"Model → {cfg.model}  (restart server to apply)")
+                    arg = rest.strip()
+                    if not arg or arg.lower() == "select":
+                        ui.rule("Select Model")
+                        for idx, (name, note) in enumerate(KNOWN_MODELS, start=1):
+                            marker = "→" if name == cfg.model else " "
+                            suffix = f"  ({note})" if note else ""
+                            ui.info(f"{marker} {idx}. {name}{suffix}")
+                        ui.info(f"\nCurrent: {cfg.model}")
+                        ui.warn("Usage: /model <number>  or  /model <repo-id>  (restart server to apply)")
+                        continue
+                    if arg.isdigit():
+                        index = int(arg) - 1
+                        if 0 <= index < len(KNOWN_MODELS):
+                            cfg.model = KNOWN_MODELS[index][0]
+                            ui.success(f"Model → {cfg.model}  (restart server to apply)")
+                        else:
+                            ui.error(f"No model at index {arg}. Run /model to see the list.")
+                        continue
+                    cfg.model = arg
+                    ui.success(f"Model → {cfg.model}  (restart server to apply)")
 
                 elif cmd == "/temp":
                     try:

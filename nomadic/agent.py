@@ -642,6 +642,8 @@ def parse_tool_call(reply: str) -> tuple[Optional[ToolCall], Optional[str]]:
     Returns `(tool_call, error_message)`. When no tool call is present, both
     values are `None`.
     """
+    if not isinstance(reply, str):
+        return None, None
     candidates = _extract_json_candidates(reply)
     saw_toolish_json = False
     last_error: Optional[str] = None

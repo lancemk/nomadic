@@ -66,7 +66,7 @@ Inside `kernel`, you currently get:
 - `/history` to inspect prior turns
 - `/config` to inspect current runtime settings
 - `/session` to inspect persisted session metadata
-- `/model <name>` to switch model config
+- `/model` to list known models and pick one by number, or `/model <name>` to switch to an arbitrary repo id (restart `serve` to apply)
 - `/temp <0.0-1.0>` to change temperature
 - `/tokens <n>` to change response budget
 - `/clear` to clear the active history
@@ -167,6 +167,8 @@ Start the local server in one terminal:
 
 ```bash
 python -m nomadic serve
+# or 
+uv run nomadic serve
 ```
 
 Initialize persistent storage once:
@@ -179,6 +181,8 @@ Then launch the agent REPL:
 
 ```bash
 python -m nomadic kernel
+# or
+uv run nomadic kernel
 ```
 
 Typical one-off overrides:

@@ -26,8 +26,10 @@ reruns remain idempotent.
 - **Interactive Slash Command Autocomplete**: Implemented dynamic, real-time dropdown menu in the REPL for slash commands using `prompt_toolkit`'s `WordCompleter` and float containers.
 - **Persistent Input History**: Added `BoundedFileHistory` allowing users to navigate previous inputs across sessions using the up-arrow key. Automatically truncates to 1000 items (configurable via `NOMADIC_HISTORY_SIZE`), saving to `~/.config/nomadic/history.txt`.
 - **Status Feedback Layer**: Introduced intermediate state indicators (e.g., *Thinking...*, *Reading codebase...*, *Running tests...*). Emits granular `StatusEvent`s from `AgentRuntime` that render as transient UI spinners via `rich.status` without polluting the persistent chat log.
+- **`/model` Selection Menu**: `/model` with no arguments (or `/model select`) now lists known model candidates with their caveats and the currently active one, and accepts a list number as a shorthand for `/model <repo-id>`.
 
 ### Fixed
+- **Crash on Null Model Response**: `/model` only updates client-side config — the running `serve` process keeps whatever model it was started with until restarted. Sending a request against a mismatched model (or one that returns `tool_calls` instead of text content) previously crashed the kernel with `VLM error: 'NoneType' object has no attribute 'strip'` deep inside tool-call parsing. `vlm_complete` now detects a null/missing `content` field and raises a clear, actionable error instead, and `agent.parse_tool_call` no longer crashes if it's ever handed a non-string reply.
 - **Dynamic MLX Server Selection**: Resolved startup crash when attempting to serve text-only language models that have vestigial vision configs (like `Qwen-AgentWorld-35B-A3B-bf16`). The launcher now automatically detects whether a model is text-only (using its config's `language_model_only` attribute or lack of vision configs) and runs `mlx_lm` instead of `mlx_vlm`.
 
 ## [0.1.0.0] - 2026-05-16

@@ -68,6 +68,8 @@ jobs:
         include:
           - os: ubuntu-24.04
             platform_id: linux-x86_64
+          - os: ubuntu-24.04-arm64
+            platform_id: linux-arm64
           - os: macos-14
             platform_id: macos-arm64
     runs-on: ${{ matrix.os }}
@@ -83,7 +85,7 @@ jobs:
           python-version: "3.14"
 
       - name: Install build tooling
-        run: python -m pip install --upgrade pip build
+        run: python -m pip install --upgrade pip build pyinstaller
 
       - name: Build release bundle
         env:

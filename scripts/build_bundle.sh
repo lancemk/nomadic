@@ -47,13 +47,42 @@ cp "${REPO_ROOT}/LICENSE.md" "${BUNDLE_ROOT}/"
 cp "${REPO_ROOT}/GUIDE.md" "${BUNDLE_ROOT}/docs/"
 cp "${REPO_ROOT}/nomadic/sql/"*.sql "${BUNDLE_ROOT}/sql/"
 
+if python3 -c "import PyInstaller" >/dev/null 2>&1; then
+  printf 'Building standalone CLI executables via PyInstaller...\n'
+  mkdir -p "${BUNDLE_ROOT}/bin"
+  python3 -m PyInstaller --onefile --name nomadic "${REPO_ROOT}/nomadic_bin.py" --add-data "${REPO_ROOT}/nomadic/sql:nomadic/sql" --clean --workpath "${TMP_ROOT}/build" --distpath "${BUNDLE_ROOT}/bin" --specpath "${TMP_ROOT}"
+  python3 -m PyInstaller --onefile --name nomadic-db "${REPO_ROOT}/db.py" --add-data "${REPO_ROOT}/nomadic/sql:nomadic/sql" --clean --workpath "${TMP_ROOT}/build" --distpath "${BUNDLE_ROOT}/bin" --specpath "${TMP_ROOT}"
+  printf 'Standalone CLI executables built successfully.\n'
+else
+  printf 'PyInstaller not found. Skipping standalone binary compilation.\n'
+fi
+
 cat > "${BUNDLE_ROOT}/install.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-python3 -m pip install "${SCRIPT_DIR}"/dist/nomadic-*.whl
-printf 'Installed nomadic from bundled wheel.\n'
+
+if [ -d "${SCRIPT_DIR}/bin" ] && [ -f "${SCRIPT_DIR}/bin/nomadic" ]; then
+  INSTALL_DIR="${1:-/usr/local/bin}"
+  printf "Found standalone binaries. Installing to %s...\n" "${INSTALL_DIR}"
+  if [ -w "${INSTALL_DIR}" ]; then
+    cp "${SCRIPT_DIR}/bin/nomadic" "${INSTALL_DIR}/nomadic"
+    if [ -f "${SCRIPT_DIR}/bin/nomadic-db" ]; then
+      cp "${SCRIPT_DIR}/bin/nomadic-db" "${INSTALL_DIR}/nomadic-db"
+    fi
+  else
+    printf "Write permission denied for %s. Retrying with sudo...\n" "${INSTALL_DIR}"
+    sudo cp "${SCRIPT_DIR}/bin/nomadic" "${INSTALL_DIR}/nomadic"
+    if [ -f "${SCRIPT_DIR}/bin/nomadic-db" ]; then
+      sudo cp "${SCRIPT_DIR}/bin/nomadic-db" "${INSTALL_DIR}/nomadic-db"
+    fi
+  fi
+  printf 'Successfully installed nomadic standalone CLI.\n'
+else
+  python3 -m pip install "${SCRIPT_DIR}"/dist/nomadic-*.whl
+  printf 'Installed nomadic from bundled wheel.\n'
+fi
 EOF
 chmod +x "${BUNDLE_ROOT}/install.sh"
 
@@ -74,3 +103,4 @@ EOF
 )
 
 printf '%s\n' "${ARCHIVE_PATH}"
+

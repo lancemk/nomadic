@@ -21,6 +21,7 @@ from urllib.parse import urlsplit, urlunsplit
 PACKAGE_ROOT = files("nomadic")
 SQLITE_SCHEMA_RESOURCE = PACKAGE_ROOT.joinpath("sql", "sqlite_schema.sql")
 POSTGRES_SCHEMA_RESOURCE = PACKAGE_ROOT.joinpath("sql", "postgres_schema.sql")
+TASKS_SCHEMA_RESOURCE = PACKAGE_ROOT.joinpath("sql", "tasks.sql")
 DEFAULT_DB_PATH = pathlib.Path("kernel.sqlite3")
 
 SESSION_STATUSES = {"active", "paused", "closed", "archived"}
@@ -572,6 +573,7 @@ def init_db(
     conn = connect(conn_or_path) if not isinstance(conn_or_path, DBConnection) else conn_or_path
     with _transaction(conn):
         _execute_script(conn, load_schema(conn.kind))
+    init_tasks_schema(conn)
     return conn
 
 
@@ -1023,12 +1025,37 @@ def build_runtime_history(
     return history
 
 
+def get_session_by_name(conn: DBConnection, name: str) -> DBRow | None:
+    return _query_one(
+        conn,
+        f"SELECT * FROM chat_sessions WHERE chat_name = {conn.placeholder} ORDER BY updated_at DESC LIMIT 1",
+        (name,),
+    )
+
+
 def list_sessions(
     conn: DBConnection,
     *,
     limit: int = 50,
     offset: int = 0,
+    pwd: str | None = None,
 ) -> list[DBRow]:
+    if pwd:
+        # Simple string match in metadata_json for now, 
+        # or more structured if using sqlite's json functions
+        # For cross-db compatibility with minimal effort:
+        return _query_all(
+            conn,
+            f"""
+            SELECT *
+            FROM chat_sessions
+            WHERE metadata_json LIKE {conn.placeholder}
+            ORDER BY updated_at DESC
+            LIMIT {conn.placeholder} OFFSET {conn.placeholder}
+            """,
+            (f'%"pwd": "{pwd}"%', limit, offset),
+        )
+
     return _query_all(
         conn,
         f"""
@@ -1038,6 +1065,118 @@ def list_sessions(
         LIMIT {conn.placeholder} OFFSET {conn.placeholder}
         """,
         (limit, offset),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Task persistence helpers (FC-4)
+# ---------------------------------------------------------------------------
+
+
+def init_tasks_schema(conn: DBConnection) -> None:
+    """Load and execute the tasks table DDL."""
+    schema_sql = TASKS_SCHEMA_RESOURCE.read_text(encoding="utf-8")
+    with _transaction(conn):
+        _execute_script(conn, schema_sql)
+
+
+def upsert_task(conn: DBConnection, task: Any) -> None:
+    """Insert or update a task row from a :class:`nomadic.tasks.Task` instance."""
+    d = task.to_dict()
+    now = utc_now()
+    artifacts_text = _json(d.get("artifacts", []))
+    metadata_text = _json(d.get("metadata", {}))
+
+    if conn.kind == "sqlite3":
+        conn.execute(
+            f"""
+            INSERT OR REPLACE INTO tasks (
+                id, objective, status, agent_id, session_id, parent_task_id,
+                result, error, artifacts_json, metadata_json,
+                created_at, updated_at
+            ) VALUES (
+                {conn.placeholder}, {conn.placeholder}, {conn.placeholder}, {conn.placeholder},
+                {conn.placeholder}, {conn.placeholder}, {conn.placeholder}, {conn.placeholder},
+                {conn.placeholder}, {conn.placeholder}, {conn.placeholder}, {conn.placeholder}
+            )
+            """,
+            (
+                d["id"], d["objective"], d["status"], d.get("agent_id"),
+                d.get("session_id"), d.get("parent_task_id"),
+                d.get("result"), d.get("error"),
+                artifacts_text, metadata_text,
+                d.get("created_at", now), now,
+            ),
+        )
+    else:
+        conn.execute(
+            f"""
+            INSERT INTO tasks (
+                id, objective, status, agent_id, session_id, parent_task_id,
+                result, error, artifacts_json, metadata_json,
+                created_at, updated_at
+            ) VALUES (
+                {conn.placeholder}, {conn.placeholder}, {conn.placeholder}, {conn.placeholder},
+                {conn.placeholder}, {conn.placeholder}, {conn.placeholder}, {conn.placeholder},
+                {conn.placeholder}, {conn.placeholder}, {conn.placeholder}, {conn.placeholder}
+            )
+            ON CONFLICT (id) DO UPDATE SET
+                objective       = EXCLUDED.objective,
+                status          = EXCLUDED.status,
+                agent_id        = EXCLUDED.agent_id,
+                session_id      = EXCLUDED.session_id,
+                parent_task_id  = EXCLUDED.parent_task_id,
+                result          = EXCLUDED.result,
+                error           = EXCLUDED.error,
+                artifacts_json  = EXCLUDED.artifacts_json,
+                metadata_json   = EXCLUDED.metadata_json,
+                updated_at      = EXCLUDED.updated_at
+            """,
+            (
+                d["id"], d["objective"], d["status"], d.get("agent_id"),
+                d.get("session_id"), d.get("parent_task_id"),
+                d.get("result"), d.get("error"),
+                artifacts_text, metadata_text,
+                d.get("created_at", now), now,
+            ),
+        )
+    conn.commit()
+
+
+def get_task(conn: DBConnection, task_id: str) -> DBRow | None:
+    """Fetch a single task row by id."""
+    return _query_one(
+        conn,
+        f"SELECT * FROM tasks WHERE id = {conn.placeholder}",
+        (task_id,),
+    )
+
+
+def list_tasks(
+    conn: DBConnection,
+    *,
+    session_id: str | None = None,
+    status: str | None = None,
+    limit: int = 100,
+) -> list[DBRow]:
+    """Return task rows with optional session/status filters."""
+    clauses: list[str] = []
+    params: list[Any] = []
+
+    if session_id is not None:
+        clauses.append(f"session_id = {conn.placeholder}")
+        params.append(session_id)
+    if status is not None:
+        clauses.append(f"status = {conn.placeholder}")
+        params.append(status)
+
+    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    params.append(limit)
+
+    return _query_all(
+        conn,
+        f"SELECT * FROM tasks{where} ORDER BY created_at DESC LIMIT {conn.placeholder}",
+        params,
     )
 
 

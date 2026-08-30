@@ -41,9 +41,10 @@ import subprocess
 import sys
 import textwrap
 import time
+import os
 import readline  # noqa: F401 — enables arrow-key history in input()
 from dataclasses import dataclass, field
-from typing import Any, Generator, Optional
+from typing import Any, Generator, Iterable, Optional
 
 # ─── optional rich ────────────────────────────────────────────────────────────
 try:
@@ -61,10 +62,14 @@ try:
     from prompt_toolkit.application import Application
     from prompt_toolkit.key_binding import KeyBindings
     from prompt_toolkit.layout import Layout
-    from prompt_toolkit.layout.containers import HSplit, Window
+    from prompt_toolkit.layout.containers import HSplit, Window, FloatContainer, Float
     from prompt_toolkit.layout.dimension import Dimension
+    from prompt_toolkit.layout.menus import CompletionsMenu
     from prompt_toolkit.styles import Style
     from prompt_toolkit.widgets import Frame, Label, TextArea
+    from prompt_toolkit.completion import WordCompleter, Completer, Completion, PathCompleter
+    from prompt_toolkit.document import Document
+    from prompt_toolkit.history import FileHistory
     _PROMPT_TOOLKIT = True
 except ImportError:
     _PROMPT_TOOLKIT = False
@@ -77,10 +82,231 @@ except ImportError:
 
 from . import agent
 from . import db as chatdb
+from .hitl import HITLManager, SafetyProfile, ReviewDecision
+from .tasks import TaskRegistry, TaskStatus
+from .orchestrator import Orchestrator, AgentInstance, AgentStatus
 
 _MEMORY_NOTE_PREFIX = "[KERNEL MEMORY SUMMARY]"
 _KERNEL_INPUT_ACCENT = "#ea7100"
 _KERNEL_EXIT_ARM_WINDOW_SECONDS = 2.0
+
+
+def normalize_model_name(model_name: str) -> str:
+    """
+    Normalize model name to match huggingface-cli / hf download repo-id.
+    Strips hf:// prefix and optional repo type prefix (e.g. models/).
+    """
+    cleaned = model_name.strip()
+    if cleaned.startswith("hf://"):
+        cleaned = cleaned[5:]
+    if cleaned.startswith("models/"):
+        cleaned = cleaned[7:]
+    return cleaned
+
+
+def get_safe_memory_budget() -> float:
+    """
+    Returns the safe memory budget in GB for inference,
+    reserving at least 8GB or 25% of total unified memory for the OS.
+    """
+    import subprocess
+    try:
+        mem_bytes = int(subprocess.check_output(["sysctl", "-n", "hw.memsize"]))
+        mem_gb = mem_bytes / (1024 ** 3)
+    except Exception:
+        mem_gb = 16.0
+    os_reserve = max(8.0, mem_gb * 0.25)
+    return max(4.0, mem_gb - os_reserve)
+
+
+def render_token_grid(used_pct: float, user_pct: float, assistant_pct: float, tool_pct: float, system_pct: float) -> str:
+    total_blocks = 100
+    user_blocks = int(round(user_pct * total_blocks))
+    assistant_blocks = int(round(assistant_pct * total_blocks))
+    tool_blocks = int(round(tool_pct * total_blocks))
+    system_blocks = int(round(system_pct * total_blocks))
+    
+    used_blocks = user_blocks + assistant_blocks + tool_blocks + system_blocks
+    free_blocks = max(0, total_blocks - used_blocks)
+    
+    blocks = []
+    blocks.extend(["[blue]●[/blue]"] * user_blocks)
+    blocks.extend(["[green]●[/green]"] * assistant_blocks)
+    blocks.extend(["[yellow]●[/yellow]"] * tool_blocks)
+    blocks.extend(["[white]●[/white]"] * system_blocks)
+    blocks.extend(["□"] * free_blocks)
+    
+    grid = []
+    for i in range(0, 100, 10):
+        grid.append(" ".join(blocks[i:i+10]))
+    return "\n".join(grid)
+
+
+def estimate_parameters_from_config(cfg_dict: dict) -> Optional[float]:
+    """Estimate model parameter count in billions from its config dictionary."""
+    if "num_parameters" in cfg_dict:
+        return cfg_dict["num_parameters"] / 1e9
+
+    h = cfg_dict.get("hidden_size") or cfg_dict.get("d_model")
+    l = cfg_dict.get("num_hidden_layers") or cfg_dict.get("num_layers") or cfg_dict.get("n_layer")
+    ff = cfg_dict.get("intermediate_size") or cfg_dict.get("ffn_dim")
+    v = cfg_dict.get("vocab_size") or 32000
+
+    if not h or not l:
+        return None
+
+    if not ff:
+        ff = 4 * h
+
+    is_swiglu = cfg_dict.get("hidden_act") in ("silu", "swish") or cfg_dict.get("mlp_bias") is False
+    mlp_factor = 3 if is_swiglu else 2
+
+    attn_params = 4 * (h ** 2) * l
+    mlp_params = mlp_factor * h * ff * l
+    embed_params = v * h
+
+    total_params = attn_params + mlp_params + embed_params
+    return total_params / 1e9
+
+
+def detect_parameters_from_name(model_name: str) -> Optional[float]:
+    """Extract parameter count in billions from model name string (e.g. 'qwen-32b' -> 32.0)."""
+    import re
+    match = re.search(r'(?i)\b(\d+(?:\.\d+)?)[bm]\b', model_name)
+    if match:
+        val = float(match.group(1))
+        if 'm' in match.group(0).lower():
+            return val / 1000.0
+        return val
+    return None
+
+
+def determine_optimal_q_bits(model_path: str) -> int:
+    """Determine optimal quantization bits based on physical memory budget and model parameter count."""
+    m_avail = get_safe_memory_budget()
+
+    p = None
+    # Try local path first
+    local_path = pathlib.Path(model_path)
+    config_file = None
+    if local_path.is_dir():
+        config_file = local_path / "config.json"
+    else:
+        try:
+            from huggingface_hub import hf_hub_download
+            config_path = hf_hub_download(repo_id=model_path, filename="config.json")
+            config_file = pathlib.Path(config_path)
+        except Exception:
+            pass
+
+    if config_file and config_file.exists():
+        try:
+            with open(config_file, "r") as f:
+                cfg_dict = json.load(f)
+            p = estimate_parameters_from_config(cfg_dict)
+        except Exception:
+            pass
+
+    if p is None:
+        p = detect_parameters_from_name(model_path)
+
+    if p is None:
+        return 4
+
+    # P * Q/8 * 1.15 + 4.0 <= M_avail => Q <= (M_avail - 4.0) * 8 / (P * 1.15)
+    limit = m_avail - 4.0
+    if limit <= 0:
+        return 2
+
+    q_max = (limit * 8) / (p * 1.15)
+    if q_max >= 8.0:
+        return 8
+    elif q_max >= 4.0:
+        return 4
+    elif q_max >= 3.0:
+        return 3
+    else:
+        return 2
+
+
+def run_quantization(model_path: str, q_bits: int, cache_dir: pathlib.Path) -> str:
+    """Execute mlx_lm convert / mlx_vlm.convert as a subprocess to quantize the model."""
+    import shutil
+    import subprocess
+
+    is_text = is_text_only_model(model_path)
+    module_name = "mlx_lm" if is_text else "mlx_vlm"
+
+    cmd = [
+        # Calling `python -m mlx_lm convert ...` directly is deprecated. Use `mlx_lm convert ...` or `python -m mlx_lm convert ...` instead.
+        # sys.executable, "-m", f"{module_name}.convert",
+        # 
+        sys.executable, "-m", f"{module_name} convert",
+        "--hf-path", model_path,
+        "-q",
+        "--q-bits", str(q_bits),
+        "-o", str(cache_dir)
+    ]
+
+    ui.rule(f"QUANTIZATION IN PROGRESS ({q_bits}-bit)")
+    ui.info(f"Source Model : {model_path}")
+    ui.info(f"Target Cache : {cache_dir}")
+    ui.info(f"Command      : {' '.join(cmd)}")
+    ui.rule()
+
+    try:
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1
+        )
+        if process.stdout:
+            for line in process.stdout:
+                print(line, end="")
+        process.wait()
+        if process.returncode != 0:
+            raise RuntimeError(f"Quantization failed with exit code {process.returncode}")
+        ui.success("Quantization completed successfully!")
+    except Exception as e:
+        if cache_dir.exists():
+            shutil.rmtree(cache_dir, ignore_errors=True)
+        raise RuntimeError(f"Quantization failed: {e}")
+    return str(cache_dir)
+
+
+def is_text_only_model(model_path: str) -> bool:
+    """Check if model is text-only (non-multimodal) based on its configuration."""
+    import json
+    import pathlib
+    model_path = normalize_model_name(model_path)
+    local_path = pathlib.Path(model_path)
+    config_file = None
+    if local_path.is_dir():
+        config_file = local_path / "config.json"
+    else:
+        try:
+            from huggingface_hub import hf_hub_download
+            config_path = hf_hub_download(repo_id=model_path, filename="config.json")
+            config_file = pathlib.Path(config_path)
+        except Exception:
+            pass
+
+    if config_file and config_file.exists():
+        try:
+            with open(config_file, "r") as f:
+                cfg = json.load(f)
+            if cfg.get("language_model_only") is True:
+                return True
+            # Check vision configuration presence in root config or text_config
+            has_vision = "vision_config" in cfg or "vision_tower" in cfg
+            if not has_vision:
+                return True
+        except Exception:
+            pass
+    return False
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SERVER CONFIG  (mlx_vlm.server inline params)
@@ -90,16 +316,27 @@ _KERNEL_EXIT_ARM_WINDOW_SECONDS = 2.0
 class ServerConfig:
     """
     Server settings plus CLI-side context controls.
-    Kept here so the tool is self-contained — no external config file needed.
+
+│Make a indepth comparison reports, of diff in JEPA based world model, that how it address the "domain knowledge" limitation│
+│ of robotics usecases, and what VLM extended model, does help in contribute (if it is even used here. COrrect if wrong) 
+
+    # ---- Out of memory
+    # model: str = "mlx-community/Qwen-AgentWorld-35B-A3B-bf16"
+
+    # ---- This model is suceptible to "Loop of the Death"
+    #
+    # model: str = "mlx-community/gemma-4-12B-bf16" 
+
+    # model: str = "mlx-community/gpt-oss-20b-MXFP4-Q8"
+    
+    # model: str = "mlx-community/Qwen3.5-27B-Claude-4.6-Opus-Distilled-MLX-4bit"
+    # model: str = "mlx-community/Qwen3.6-40B-Claude-4.6-Opus-Deckard-Heretic-Uncensored-Thinking-8bit"
+
     """
+    # model: str = "mlx-community/"....
+
     # ── Model selection ──────────────────────────────────────────────────────
-    model: str = "mlx-community/gemma-4-26b-a4b-it-4bit"
-    # model: str = "mlx-community/Qwen2.5-VL-7B-Instruct-4bit"
-    #   Alternatives ranked by SKILL.md comprehension quality:
-    #     "mlx-community/Pixtral-12B-2409-4bit"         ← best OCR of markdown
-    #     "mlx-community/Qwen2-VL-7B-Instruct-4bit"     ← balanced
-    #     "mlx-community/llava-1.6-mistral-7b-4bit"     ← fast, lower RAM
-    #     "mlx-community/Phi-3.5-vision-instruct-4bit"  ← small, 6 GB
+    model: str = "mlx-community/gemma-4-26b-a4b-it-4bit" # !! Best stable so far. On local
 
     # ── Server bind ─────────────────────────────────────────────────────────
     host: str = "127.0.0.1"
@@ -121,8 +358,23 @@ class ServerConfig:
         default_factory=lambda: os.getenv("METADATA_BASE_URL", "http://localhost:8888")
     )
 
+    # ── Profiles & Presets ──────────────────────────────────────────────────
+    profiles: dict[str, dict[str, Any]] = field(default_factory=dict)
+    presets: dict[str, str] = field(default_factory=dict)
+    templates: dict[str, str] = field(default_factory=dict)
+
+    # ── Runtime Quantization & Cache ─────────────────────────────────────────
+    quantize: bool = False
+    q_bits: str = "auto"
+    cache_dir: Optional[str] = None
+
     # ── Structured tool-calling kernel ──────────────────────────────────────
     cot_system_prompt: str = field(default_factory=agent.default_system_prompt)
+
+    def __setattr__(self, name: str, value: Any):
+        if name == "model" and isinstance(value, str):
+            value = normalize_model_name(value)
+        super().__setattr__(name, value)
 
     @property
     def base_url(self) -> str:
@@ -130,15 +382,74 @@ class ServerConfig:
 
     @property
     def server_argv(self) -> list[str]:
-        """Arguments passed to `python -m mlx_vlm.server`."""
-        return [
-            sys.executable, "-m", "mlx_vlm.server",
-            "--model",       self.model,
-            "--host",        self.host,
-            "--port",        str(self.port),
-            # mlx_vlm.server does not expose temp/top_p at CLI level;
-            # those are per-request params sent in the JSON body.
-        ]
+        """Arguments passed to the local server command."""
+        if is_text_only_model(self.model):
+            return [
+                sys.executable, "-m", "mlx_lm", "server",
+                "--model",       self.model,
+                "--host",        self.host,
+                "--port",        str(self.port),
+            ]
+        else:
+            return [
+                sys.executable, "-m", "mlx_vlm", "server",
+                "--model",       self.model,
+                "--host",        self.host,
+                "--port",        str(self.port),
+            ]
+
+    def apply_profile(self, name: str) -> bool:
+        """Override current settings with values from a named profile."""
+        if name not in self.profiles:
+            return False
+        overrides = self.profiles[name]
+        for key, value in overrides.items():
+            if hasattr(self, key):
+                setattr(self, key, value)
+        return True
+
+    def apply_preset(self, name: str) -> bool:
+        """Override system prompt with a named preset."""
+        if name not in self.presets:
+            return False
+        self.cot_system_prompt = self.presets[name]
+        return True
+
+    def format_template(self, name: str, args_string: str) -> str | None:
+        """Format a named template with positional arguments."""
+        if name not in self.templates:
+            return None
+        template = self.templates[name]
+        # Very simple positional replacement: {0}, {1}, etc.
+        args = [arg.strip() for arg in args_string.split(",")] if args_string else []
+        try:
+            return template.format(*args)
+        except IndexError:
+            return None
+
+
+def load_server_config(config_path: str | pathlib.Path | None = None) -> ServerConfig:
+    """Load ServerConfig from config.jsonc, merging with defaults."""
+    cfg = ServerConfig()
+    try:
+        payload = chatdb.load_config_file(config_path)
+        server = payload.get("server", {})
+        if isinstance(server, dict):
+            for key, value in server.items():
+                if key in ("profiles", "presets", "templates"):
+                    setattr(cfg, key, value)
+                elif hasattr(cfg, key) and not key.startswith("_"):
+                    setattr(cfg, key, value)
+        
+        kernel = payload.get("kernel", {})
+        if isinstance(kernel, dict):
+            for key, value in kernel.items():
+                if hasattr(cfg, key) and not key.startswith("_"):
+                    setattr(cfg, key, value)
+                    
+    except Exception:
+        pass
+    return cfg
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -152,6 +463,20 @@ class UI:
 
     def __init__(self):
         self.con = Console(highlight=False) if _RICH else None
+        self._current_status = None
+
+    def start_status(self, msg: str):
+        if _RICH and self.con:
+            self.stop_status()
+            self._current_status = self.con.status(f"[cyan]{msg}[/]")
+            self._current_status.start()
+        else:
+            print(f"[{msg}]")
+
+    def stop_status(self):
+        if _RICH and self._current_status:
+            self._current_status.stop()
+            self._current_status = None
 
     def rule(self, title: str = ""):
         if _RICH:
@@ -312,6 +637,45 @@ def resolve_next_action_selection(
     return KernelNextActionSelection(kind="none")
 
 
+if _PROMPT_TOOLKIT:
+    class BoundedFileHistory(FileHistory):
+        """FileHistory that truncates to a maximum length."""
+        
+        def __init__(self, filename: str, max_length: int = 1000):
+            super().__init__(filename)
+            self.max_length = max_length
+            self._append_count = 0
+
+        def load_history_strings(self) -> Iterable[str]:
+            # parent returns newest first
+            strings = list(super().load_history_strings())
+            if len(strings) > self.max_length:
+                return strings[:self.max_length]
+            return strings
+
+        def store_string(self, string: str) -> None:
+            super().store_string(string)
+            self._append_count += 1
+            
+            # Rewrite file occasionally to prevent infinite growth
+            if self._append_count >= 50:
+                self._rewrite()
+
+        def _rewrite(self) -> None:
+            strings = list(super().load_history_strings())
+            if len(strings) > self.max_length:
+                strings = strings[:self.max_length]
+                strings.reverse() # oldest first for writing
+                
+                with open(self.filename, 'wb') as f:
+                    pass # clear
+                    
+                for s in strings:
+                    super().store_string(s)
+                    
+            self._append_count = 0
+
+
 class KernelInput:
     def __init__(self, ui: UI):
         self.ui = ui
@@ -344,6 +708,57 @@ class KernelInput:
         return input(f"{label}: ")
 
     def _prompt_multiline(self, label: str) -> str:
+        commands = [
+            "/goal", "/go", "/grill-me", "/agents", "/tasks", "/browser", 
+            "/fork", "/rewind", "/undo", "/resume", "/switch", "/clear", "/rename", 
+            "/btw", "/diff", "/artifacts", "/add-dir", "/context", "/usage", "/config", 
+            "/settings", "/export", "/help", "/exit", "/quit", "/skill", "/image", "/exec", 
+            "/profile", "/preset", "/template", "/model", "/temp", "/tokens", "/save", "/chat", 
+            "/safety", "/review", "/task"
+        ]
+        
+        placeholders = {
+            "/goal", "/go", "/grill-me", "/agents", "/tasks", "/browser", 
+            "/fork", "/rewind", "/undo", "/switch", "/rename", "/btw", 
+            "/diff", "/artifacts", "/add-dir", "/context", "/usage", 
+            "/settings", "/export"
+        }
+        
+        
+        display_dict = {
+            cmd: f"{cmd} (TBD)" if cmd in placeholders else cmd 
+            for cmd in commands
+        }
+        
+        class KernelCompleter(Completer):
+            def __init__(self):
+                self.cmd_completer = WordCompleter(commands, ignore_case=True, display_dict=display_dict)
+                self.path_completer = PathCompleter(expanduser=True)
+                
+            def get_completions(self, document, complete_event):
+                word = document.get_word_before_cursor(WORD=True)
+                if word.startswith("/"):
+                    yield from self.cmd_completer.get_completions(document, complete_event)
+                elif word.startswith("@"):
+                    fake_doc = Document(
+                        document.text_before_cursor[:-len(word)] + word[1:], 
+                        cursor_position=document.cursor_position - 1
+                    )
+                    for c in self.path_completer.get_completions(fake_doc, complete_event):
+                        yield Completion(c.text, start_position=c.start_position, display=c.display)
+                        
+        completer = KernelCompleter()
+
+        # Setup history
+        try:
+            max_hist = int(os.environ.get("NOMADIC_HISTORY_SIZE", "1000"))
+        except ValueError:
+            max_hist = 1000
+        
+        history_path = chatdb.default_config_dir() / "history.txt"
+        history_path.parent.mkdir(parents=True, exist_ok=True)
+        history = BoundedFileHistory(str(history_path), max_length=max_hist)
+
         text_area = TextArea(
             multiline=True,
             wrap_lines=True,
@@ -351,6 +766,9 @@ class KernelInput:
             scrollbar=False,
             style="class:input-body",
             height=Dimension(min=3, max=12),
+            completer=completer,
+            complete_while_typing=True,
+            history=history,
         )
         help_text = Label(
             text="Enter submit  Shift+Enter newline  Ctrl-D exit",
@@ -358,12 +776,21 @@ class KernelInput:
             dont_extend_height=True,
         )
         frame = Frame(text_area, title=label, style="class:input-frame")
-        root = HSplit(
-            [
-                frame,
-                Window(height=1, char=" "),
-                help_text,
-            ]
+        root = FloatContainer(
+            content=HSplit(
+                [
+                    frame,
+                    Window(height=1, char=" "),
+                    help_text,
+                ]
+            ),
+            floats=[
+                Float(
+                    xcursor=True,
+                    ycursor=True,
+                    content=CompletionsMenu(max_height=8, scroll_offset=1),
+                )
+            ],
         )
         style = Style.from_dict(
             {
@@ -371,6 +798,8 @@ class KernelInput:
                 "input-frame.label": f"bold fg:{_KERNEL_INPUT_ACCENT}",
                 "input-body": "",
                 "input-help": f"fg:{_KERNEL_INPUT_ACCENT} italic",
+                "completion-menu": "bg:#333333 fg:white",
+                "completion-menu.completion.current": f"bg:{_KERNEL_INPUT_ACCENT} fg:black",
             }
         )
         kb = KeyBindings()
@@ -673,7 +1102,39 @@ def _build_memory_note(messages: list[dict], *, max_lines: int, max_chars: int) 
     return "\n".join(lines)
 
 
-def _compact_history_pass(history: list[dict], *, target_tokens: int) -> list[dict]:
+def _generate_semantic_memory(cfg: ServerConfig, compressed_messages: list[dict], existing_memory: str = "") -> str:
+    """Uses the VLM to generate a dense semantic summary of compressed messages."""
+    raw_text = "\n".join(_summarize_message(msg) for msg in compressed_messages)
+    
+    prompt = (
+        "You are an expert at extracting dense, highly relevant context from conversation logs. "
+        "Summarize the following past conversation turns into a compact 'memory note'. "
+        "Focus ONLY on established facts, user preferences, code structure, paths, and unresolved problems. "
+        "DO NOT summarize greetings or pleasantries. "
+        "Return ONLY the summary text, no formatting, no preamble."
+    )
+    
+    if existing_memory:
+        prompt += f"\n\nExisting memory context to integrate:\n{existing_memory}"
+        
+    prompt += f"\n\nRecent turns to compress:\n{raw_text}"
+
+    messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
+    
+    try:
+        summary = vlm_complete(cfg, messages, stream=False)
+        return summary.strip()
+    except Exception as e:
+        ui.warn(f"Semantic summarization failed: {e}")
+        return ""
+
+
+def _compact_history_pass(
+    history: list[dict], 
+    *, 
+    target_tokens: int,
+    cfg: Optional[ServerConfig] = None,
+) -> list[dict]:
     if len(history) <= 2:
         return history
 
@@ -705,16 +1166,28 @@ def _compact_history_pass(history: list[dict], *, target_tokens: int) -> list[di
         compressed = source[:-1]
         tail = source[-1:]
 
-    if existing_memory:
-        compressed = existing_memory + compressed
-
-    memory_note = {
-        "role": "system",
-        "content": _build_memory_note(
+    existing_mem_str = _memory_note_body(existing_memory[0]) if existing_memory else ""
+    
+    # Generate semantic memory if we have a config (meaning we can call the VLM)
+    semantic_summary = ""
+    if cfg is not None and compressed:
+        semantic_summary = _generate_semantic_memory(cfg, compressed, existing_memory=existing_mem_str)
+        
+    if semantic_summary:
+        content = f"{_MEMORY_NOTE_PREFIX}\n{semantic_summary}"
+    else:
+        # Fallback to simple truncation
+        if existing_memory:
+            compressed = existing_memory + compressed
+        content = _build_memory_note(
             compressed,
             max_lines=8,
             max_chars=max(120, reserve * 2),
-        ),
+        )
+
+    memory_note = {
+        "role": "system",
+        "content": content,
     }
 
     return [system, memory_note] + tail
@@ -813,10 +1286,11 @@ def vlm_complete(
 
 def cmd_serve(cfg: ServerConfig):
     """
-    Launch mlx_vlm.server as a subprocess with inlined params.
+    Launch mlx_vlm.server or mlx_lm.server as a subprocess with inlined params.
     Blocks until Ctrl-C.
     """
-    ui.rule("mlx_vlm.server")
+    server_type = "mlx_lm" if is_text_only_model(cfg.model) else "mlx_vlm"
+    ui.rule(f"{server_type}.server")
     ui.info(f"Model : {cfg.model}")
     ui.info(f"Bind  : {cfg.host}:{cfg.port}")
     ui.info(f"Cmd   : {' '.join(cfg.server_argv)}")
@@ -866,8 +1340,9 @@ def cmd_extract(
     ui.rule("SKILL.md Context Extraction")
 
     if not _check_server(cfg):
+        server_type = "mlx_lm" if is_text_only_model(cfg.model) else "mlx_vlm"
         ui.error(
-            f"mlx_vlm.server not reachable at {cfg.base_url}\n"
+            f"{server_type} server not reachable at {cfg.base_url}\n"
             "  Run first:  python -m nomadic serve"
         )
         sys.exit(1)
@@ -934,28 +1409,59 @@ _KERNEL_BANNER = r"""
                               by Bitstric Labs
 """
 
-_KERNEL_HELP = """
+_KERNEL_HELP_BASE = """
 ┌─ Kernel Commands ───────────────────────────────────────────┐
+│ 🛠️  Execution & Agent Control                                │
+│  /goal              Run autonomously to task completion     │
+│  /go                Execute next steps without prompt       │
+│  /grill-me          Force agent to ask clarifying questions │
+│  /agents            Agent Manager Panel for subagents       │
+│  /tasks             Track background processes              │
+│  /browser           Opt-into browser capabilities           │
+│                                                             │
+│ 💬 Conversation & Session State                             │
+│  /fork              Branch conversation to new session      │
+│  /rewind, /undo     Rollback conversation history           │
+│  /resume, /switch   Resume previous conversation            │
+│  /clear             Clear conversation history              │
+│  /rename <name>     Rename active conversation thread       │
+│  /btw <query>       Ask background side question            │
+│                                                             │
+│ 📁 Workspace & System Utilities                             │
+│  /diff              View workspace diff                     │
+│  /artifacts         Open generated components panel         │
+│  /add-dir <path>    Add directory to active workspace       │
+│  /context           Live token usage & checkpoints          │
+│  /usage             Real-time quota & rate-limit status     │
+│  /config, /settings Interactive Settings Editor             │
+│  /export            Push session state to GUI               │
+│  /help              This message                            │
+│  /exit, /quit       Exit TUI safely                         │
+│                                                             │
+│ ⚙️  Advanced (Legacy)                                       │
 │  /skill <path>      Load a SKILL.md into context            │
 │  /image <path>      Attach an image to next message         │
-│  /exec <cmd>        Run a shell command (output → context)  │
-│  /clear             Clear conversation history              │
-│  /history           Print conversation history              │
-│  /config            Show current ServerConfig               │
-│  /session           Show active Session metadata            │
-│  /model <name>      Switch model (restarts server needed)   │
+│  /exec <cmd>        Run a shell command                     │
+│  /profile <name>    Switch to a named config profile        │
+│  /preset <name>     Switch to a named system prompt preset  │
+│  /template <name>   Execute a parameterized prompt template │
+│  /model <name>      Switch model                            │
 │  /temp <0.0–1.0>    Set temperature                         │
 │  /tokens <n>        Set max_tokens per turn                 │
-│  /save <file>       Save conversation to JSON               │
-│  /help              This message                            │
-│  /quit  or  Ctrl-D  Exit                                    │
-│  Ctrl-C             Press twice quickly to exit             │
+│  /save <name>       Name current chat in DB or export JSON  │
+│  /chat ...          Session management subcommands          │
 └─────────────────────────────────────────────────────────────┘
+"""
+
+_KERNEL_HELP_INPUT = """
 Input editor:
   Enter submits the current message.
   Shift+Enter inserts a newline in the enhanced editor.
   If prompt_toolkit is unavailable, the kernel falls back to the
   classic single-line prompt.
+"""
+
+_KERNEL_HELP_RESPONSE = """
 Post-response next steps:
   After each agent reply, the kernel suggests:
   1) recommended next action
@@ -963,16 +1469,28 @@ Post-response next steps:
   3) alternate next action
   4) other (free text)
   Type 1-4 at the next prompt to use them.
+"""
+
+_KERNEL_HELP_TOOL_CALL_PROTOCOL = """
 Model tool-call protocol:
   {"tool_call":{"name":"read_skill","arguments":{"path":"..."}}}
   {"tool_call":{"name":"exec_shell","arguments":{"command":"..."}}}
   {"tool_call":{"name":"metadata_search","arguments":{"query":"..."}}}
+"""
+
+_KERNEL_HELP_CONTEXT = """
 Context management:
   Automatic compression keeps the system prompt + newest turns
   when the approximate non-system history budget is exceeded.
   Configure with --max-skill-chars, --max-context-tokens, and
   --context-recompress-to.
 """
+
+# + _KERNEL_HELP_RESPONSE \
+_KERNEL_HELP = _KERNEL_HELP_BASE \
+    + _KERNEL_HELP_INPUT \
+    + _KERNEL_HELP_TOOL_CALL_PROTOCOL \
+    + _KERNEL_HELP_CONTEXT \
 
 @dataclass
 class KernelState:
@@ -1210,7 +1728,7 @@ class KernelState:
         working_history = self.history
 
         for _ in range(6):
-            new_history = _compact_history_pass(working_history, target_tokens=target)
+            new_history = _compact_history_pass(working_history, target_tokens=target, cfg=self.cfg)
             if new_history == working_history:
                 break
 
@@ -1351,21 +1869,143 @@ def cmd_initialize(
     ui.info(f"DB Target   : {chatdb.describe_database_target(settings)}")
 
 
-def cmd_kernel(cfg: ServerConfig, db_settings: chatdb.DatabaseSettings, session_id: Optional[str]):
+def cmd_kernel(
+    cfg: ServerConfig,
+    db_settings: chatdb.DatabaseSettings,
+    session_id: Optional[str],
+    profile: Optional[str] = None,
+):
     """Interactive structured tool-calling kernel."""
+
+    # ── Merge config from file ──────────────────────────────────────────────
+    cfg_file = load_server_config()
+    # Merge cfg_file into cfg (which came from CLI flags)
+    # CLI flags take precedence over config file, but profiles are only in file.
+    cfg.profiles = cfg_file.profiles
+    cfg.presets = cfg_file.presets
+
+    if profile:
+        if not cfg.apply_profile(profile):
+            ui.warn(f"Profile not found: {profile}")
+        else:
+            ui.info(f"Using profile: {profile}")
 
     conn = chatdb.connect(db_settings)
     db_target = chatdb.describe_database_target(db_settings)
     state: Optional[KernelState] = None
+    
+    # ── Initialize Tool Registry ────────────────────────────────────────────
     tool_registry = agent.build_default_registry()
+    # Load user-defined tool packs from ~/.config/nomadic/tools
+    user_tools_dir = chatdb.default_config_dir() / "tools"
+    if user_tools_dir.exists():
+        tool_registry.load_from_directory(user_tools_dir)
+    
     input_layer = KernelInput(ui)
     interrupt_controller = KernelInterruptController()
+    
+    # ── Orchestrator & TaskRegistry & HITL Manager ──
+    hitl_manager = HITLManager(SafetyProfile.SEMI_AUTONOMOUS)
+    task_registry = TaskRegistry(conn)
+    orchestrator = Orchestrator(
+        default_system_prompt=cfg.cot_system_prompt,
+        default_tool_registry=tool_registry,
+        hitl_manager=hitl_manager,
+        task_registry=task_registry,
+    )
+    
+    # ── Browser State & Handlers ──
+    browser_state = {"playwright": None, "browser": None, "page": None}
+    
+    def handle_browser_navigate(args, runtime):
+        url = args.get("url")
+        if not url:
+            return agent.ToolExecutionResult("browser_navigate", "browser", "error", "Missing 'url' argument.")
+        if not browser_state.get("page"):
+            return agent.ToolExecutionResult("browser_navigate", "browser", "error", "Browser is not active.")
+        try:
+            browser_state["page"].goto(url)
+            title = browser_state["page"].title()
+            return agent.ToolExecutionResult(
+                "browser_navigate",
+                "browser",
+                "ok",
+                f"Successfully navigated to {url}. Page Title: {title}",
+                payload={"url": url, "title": title}
+            )
+        except Exception as e:
+            return agent.ToolExecutionResult("browser_navigate", "browser", "error", f"Failed to navigate: {e}")
+
+    def handle_browser_screenshot(args, runtime):
+        if not browser_state.get("page"):
+            return agent.ToolExecutionResult("browser_screenshot", "browser", "error", "Browser is not active.")
+        try:
+            import time
+            screenshot_path = chatdb.default_config_dir() / f"screenshot_{int(time.time())}.png"
+            screenshot_path.parent.mkdir(parents=True, exist_ok=True)
+            browser_state["page"].screenshot(path=str(screenshot_path))
+            runtime.state.pending_image = str(screenshot_path)
+            return agent.ToolExecutionResult(
+                "browser_screenshot",
+                "browser",
+                "ok",
+                f"Screenshot saved to {screenshot_path}. Queued for next message.",
+                payload={"path": str(screenshot_path)}
+            )
+        except Exception as e:
+            return agent.ToolExecutionResult("browser_screenshot", "browser", "error", f"Failed to capture screenshot: {e}")
+
+    def handle_browser_extract_text(args, runtime):
+        if not browser_state.get("page"):
+            return agent.ToolExecutionResult("browser_extract_text", "browser", "error", "Browser is not active.")
+        try:
+            text = browser_state["page"].locator("body").inner_text()
+            return agent.ToolExecutionResult(
+                "browser_extract_text",
+                "browser",
+                "ok",
+                text[:12000],
+                payload={"text_len": len(text)}
+            )
+        except Exception as e:
+            return agent.ToolExecutionResult("browser_extract_text", "browser", "error", f"Failed to extract text: {e}")
+
+    async def run_agent_interactive(orchestrator, agent_id, cfg, state, ui):
+        def complete_fn(history, stream=False):
+            return vlm_complete(cfg, history, stream=stream)
+        instance = orchestrator.get_agent(agent_id)
+        if not instance:
+            return
+        while not instance.is_terminal:
+            res = await instance.run(complete_fn, ui)
+            if instance.status == AgentStatus.AWAITING_REVIEW:
+                req = instance.hitl_manager.pending_reviews.get(instance.id)
+                if req:
+                    prompt_text = instance.hitl_manager.format_review_prompt(req)
+                    print(prompt_text)
+                    user_choice = ui.prompt("HITL Choice (a/r/m/s/q)")
+                    if user_choice.strip().lower() in ("q", "quit", "exit"):
+                        ui.warn("Aborted agent execution.")
+                        instance.status = AgentStatus.CANCELLED
+                        if instance.task:
+                            orchestrator.task_registry.cancel_task(instance.task.id)
+                        break
+                    result = instance.hitl_manager.parse_review_input(user_choice, req)
+                    instance.resolve_review(
+                        decision=result.decision,
+                        modified_args=result.modified_arguments,
+                        feedback=result.feedback,
+                        ui=ui
+                    )
+            else:
+                break
     try:
         chatdb.init_db(conn)
 
         if not _check_server(cfg):
+            server_type = "mlx_lm" if is_text_only_model(cfg.model) else "mlx_vlm"
             ui.error(
-                f"mlx_vlm.server not reachable at {cfg.base_url}\n"
+                f"{server_type} server not reachable at {cfg.base_url}\n"
                 "  Run first:  python -m nomadic serve"
             )
             sys.exit(1)
@@ -1379,6 +2019,7 @@ def cmd_kernel(cfg: ServerConfig, db_settings: chatdb.DatabaseSettings, session_
                     conn,
                     system_prompt=cfg.cot_system_prompt,
                     config=cfg,
+                    metadata={"pwd": os.getcwd()},
                 )
                 mode = "created"
         except KeyError as exc:
@@ -1386,6 +2027,7 @@ def cmd_kernel(cfg: ServerConfig, db_settings: chatdb.DatabaseSettings, session_
             return
 
         state = _load_kernel_state(conn, session, cfg)
+        task_registry.load_from_db(state.session_id)
         chatdb.record_event(
             conn,
             state.session_id,
@@ -1530,6 +2172,96 @@ def cmd_kernel(cfg: ServerConfig, db_settings: chatdb.DatabaseSettings, session_
                     if state.session:
                         ui.panel("Session", json.dumps(state.session, indent=2, default=str))
 
+                elif cmd == "/profile":
+                    if not rest:
+                        if cfg.profiles:
+                            ui.info(f"Available profiles: {', '.join(cfg.profiles.keys())}")
+                        else:
+                            ui.warn("No profiles defined in config.jsonc.")
+                        ui.warn("Usage: /profile <name>")
+                        continue
+                    if cfg.apply_profile(rest.strip()):
+                        ui.success(f"Applied profile: {rest.strip()}")
+                    else:
+                        ui.error(f"Profile not found: {rest.strip()}")
+
+                elif cmd == "/preset":
+                    if not rest:
+                        if cfg.presets:
+                            ui.info(f"Available presets: {', '.join(cfg.presets.keys())}")
+                        else:
+                            ui.warn("No presets defined in config.jsonc.")
+                        ui.warn("Usage: /preset <name>")
+                        continue
+                    if cfg.apply_preset(rest.strip()):
+                        ui.success(f"Applied preset: {rest.strip()}")
+                    else:
+                        ui.error(f"Preset not found: {rest.strip()}")
+
+                elif cmd == "/template":
+                    subparts = rest.split(maxsplit=1)
+                    if not subparts:
+                        if cfg.templates:
+                            ui.info(f"Available templates: {', '.join(cfg.templates.keys())}")
+                        else:
+                            ui.warn("No templates defined in config.jsonc.")
+                        ui.warn("Usage: /template <name> [arg0, arg1, ...]")
+                        continue
+                    
+                    tname = subparts[0]
+                    targs = subparts[1] if len(subparts) > 1 else ""
+                    formatted = cfg.format_template(tname, targs)
+                    if formatted is None:
+                        ui.error(f"Failed to format template: {tname}. Check name and arguments.")
+                    else:
+                        ui.success(f"Template '{tname}' evaluated. Submitting as user prompt...")
+                        # Pretend the user typed this and skip to the next loop iteration.
+                        # We must modify the submission object and break out of the built-in commands block.
+                        submission = KernelInputSubmission(raw=formatted, stripped=formatted.strip(), kind="message")
+                        # We do not `continue` here; we let it fall through to the VLM completion phase
+                        # by essentially rewriting the submission.
+                        pass # Fallthrough is safe here because it's the last check if we break out of the elif chain.
+                        
+                        # Wait, we are in an `if submission.kind == "command":` block.
+                        # If we break out, we will hit the "continue" at the end of the block.
+                        # Instead, let's process it immediately as if it were a message turn.
+                        
+                        state.next_actions = []
+                        state.add_user(submission.raw, state.pending_image)
+                        state.compact_history_if_needed()
+
+                        ui.rule(f"turn {state.turn} · agent response")
+                        t0 = time.perf_counter()
+
+                        try:
+                            reply = agent.run_agent_loop(
+                                state=state,
+                                complete_fn=vlm_complete,
+                                ui=ui,
+                                registry=tool_registry,
+                            )
+                        except KeyboardInterrupt:
+                            ui.warn("Interrupted current run; returning to the kernel prompt.")
+                            continue
+                        except Exception as e:
+                            ui.error(f"VLM error: {e}")
+                            continue
+
+                        elapsed = time.perf_counter() - t0
+
+                        ui.rule()
+                        ui.info(
+                            f"{elapsed:.1f}s · {len(reply.split()):,} words · "
+                            f"history ~{_estimate_history_tokens(state.history):,} tokens · "
+                            f"{len(state.history)} messages"
+                        )
+                        state.next_actions = generate_next_action_options(cfg, state.history)
+                        menu = render_next_action_menu(state.next_actions)
+                        if menu:
+                            ui.panel("User Action On Next Step", menu)
+                        
+                        continue
+                        
                 elif cmd == "/session":
                     if state.session:
                         session_payload = {
@@ -1644,16 +2376,737 @@ def cmd_kernel(cfg: ServerConfig, db_settings: chatdb.DatabaseSettings, session_
                         ui.warn("Command failed; result injected into context.")
 
                 elif cmd == "/save":
-                    fname = rest.strip() or f"kernel_session_{int(time.time())}.json"
+                    if rest and not rest.strip().endswith(".json"):
+                        state.session = dict(chatdb.update_session(conn, state.session_id, chat_name=rest.strip()))
+                        ui.success(f"Session saved in DB as: {state.chat_name}")
+                    else:
+                        fname = rest.strip() or f"kernel_session_{int(time.time())}.json"
+                        export_payload = {
+                            "session": state.session,
+                            "history": state.history,
+                        }
+                        pathlib.Path(fname).write_text(
+                            json.dumps(export_payload, indent=2, default=str)
+                        )
+                        ui.success(f"Saved to file → {fname}")
+
+                elif cmd == "/chat":
+                    subparts = rest.split(maxsplit=1)
+                    subcmd = subparts[0].lower() if subparts else "list"
+                    subrest = subparts[1] if len(subparts) > 1 else ""
+
+                    if subcmd == "list":
+                        pwd = os.getcwd()
+                        sessions = chatdb.list_sessions(conn, pwd=pwd)
+                        if not sessions:
+                            ui.warn(f"No sessions found for {pwd}")
+                        else:
+                            ui.rule(f"Sessions in {pwd}")
+                            for s in sessions:
+                                print(f"  {s['id'][:8]}... | {s['chat_name']:30} | {s['updated_at']}")
+
+                    elif subcmd == "resume":
+                        if not subrest:
+                            ui.warn("Usage: /chat resume <id|name>")
+                            continue
+                        target_id = subrest.strip()
+                        target_session = chatdb.get_session(conn, target_id)
+                        if not target_session:
+                            target_session = chatdb.get_session_by_name(conn, target_id)
+
+                        if target_session:
+                            session = chatdb.resume_session(conn, target_session["id"])
+                            state = _load_kernel_state(conn, session, cfg)
+                            ui.success(f"Resumed session: {state.chat_name}")
+                        else:
+                            ui.error(f"Session not found: {subrest}")
+
+                    elif subcmd == "rename":
+                        if not subrest:
+                            ui.warn("Usage: /chat rename <new_name>")
+                            continue
+                        state.session = dict(chatdb.update_session(conn, state.session_id, chat_name=subrest.strip()))
+                        ui.success(f"Session renamed to: {state.chat_name}")
+
+                    else:
+                        ui.warn("Usage: /chat [list|resume|rename]")
+
+                elif cmd == "/resume":
+                    if not rest:
+                        ui.warn("Usage: /resume <id|name>")
+                        continue
+                    target_id = rest.strip()
+                    target_session = chatdb.get_session(conn, target_id)
+                    if not target_session:
+                        target_session = chatdb.get_session_by_name(conn, target_id)
+
+                    if target_session:
+                        session = chatdb.resume_session(conn, target_session["id"])
+                        state = _load_kernel_state(conn, session, cfg)
+                        ui.success(f"Resumed session: {state.chat_name}")
+                    else:
+                        ui.error(f"Session not found: {rest}")
+
+                elif cmd in ("/settings", "/switch", "/undo"):
+                    # Aliases for existing commands
+                    if cmd == "/settings":
+                        ui.warn("Alias /settings mapped to /config (run /config manually for now)")
+                    elif cmd == "/switch":
+                        ui.warn("Alias /switch mapped to /resume (run /resume manually for now)")
+                    elif cmd == "/undo":
+                        ui.warn("Alias /undo mapped to /rewind (run /rewind manually for now)")
+                        
+                elif cmd == "/goal":
+                    objective = rest.strip()
+                    if not objective:
+                        objective = "Continue working on the current task based on conversation history."
+                    ui.info(f"Starting goal-oriented execution: {objective}")
+                    task = orchestrator.task_registry.create_task(
+                        objective=objective,
+                        session_id=state.session_id,
+                    )
+                    agent_inst = orchestrator.spawn_agent(
+                        task=task,
+                        system_prompt=cfg.cot_system_prompt,
+                        tool_registry=tool_registry,
+                    )
+                    existing_msgs = [m for m in state.history if m["role"] != "system"]
+                    agent_inst.history = [{"role": "system", "content": agent_inst.system_prompt}] + existing_msgs + [{"role": "user", "content": f"New Objective: {objective}"}]
+                    asyncio.run(run_agent_interactive(orchestrator, agent_inst.id, cfg, state, ui))
+                    state.history = list(agent_inst.history)
+                    if agent_inst.task and agent_inst.task.result:
+                        ui.success(f"Goal achieved: {agent_inst.task.result}")
+                    elif agent_inst.status == AgentStatus.FAILED:
+                        ui.error(f"Goal failed: {agent_inst.error}")
+
+                elif cmd == "/go":
+                    ui.info("Resuming agent execution on current context...")
+                    state.next_actions = []
+                    ui.rule(f"turn {state.turn} · agent response")
+                    t0 = time.perf_counter()
+                    def status_callback(event: agent.StatusEvent):
+                        ui.start_status(event.message)
+                    try:
+                        reply = agent.run_agent_loop(
+                            state=state,
+                            complete_fn=vlm_complete,
+                            ui=ui,
+                            registry=tool_registry,
+                            status_callback=status_callback,
+                        )
+                    except KeyboardInterrupt:
+                        ui.warn("Interrupted current run; returning to the kernel prompt.")
+                        continue
+                    except Exception as e:
+                        ui.error(f"VLM error: {e}")
+                        continue
+                    finally:
+                        ui.stop_status()
+                    elapsed = time.perf_counter() - t0
+                    ui.rule()
+                    ui.info(
+                        f"{elapsed:.1f}s · {len(reply.split()):,} words · "
+                        f"history ~{_estimate_history_tokens(state.history):,} tokens · "
+                        f"{len(state.history)} messages"
+                    )
+                    state.next_actions = generate_next_action_options(cfg, state.history)
+                    menu = render_next_action_menu(state.next_actions)
+                    if menu:
+                        ui.panel("User Action On Next Step", menu)
+
+                elif cmd == "/grill-me":
+                    topic = rest.strip()
+                    ui.info("Entering interrogative mode. Let's clarify requirements...")
+                    grill_prompt = (
+                        "[INTERROGATIVE MODE] Your goal is to grill the user with clarifying questions "
+                        "about their request to resolve any ambiguity. Ask one question at a time. "
+                        "Do not use tools. When you believe all ambiguity is resolved and you have "
+                        "enough detail to proceed, respond with exactly: 'ALL_RESOLVED'."
+                    )
+                    state.inject_context(grill_prompt, source="grill_mode")
+                    if topic:
+                        state.add_user(f"I want to: {topic}")
+                    else:
+                        state.add_user("Please ask clarifying questions to help me define my goal.")
+                    while True:
+                        ui.rule("Grill Turn")
+                        reply = vlm_complete(cfg, state.history, stream=True)
+                        print()
+                        if "ALL_RESOLVED" in reply:
+                            ui.success("All requirements clarified! Exiting grill mode.")
+                            state.add_assistant("All requirements clarified.")
+                            break
+                        state.add_assistant(reply)
+                        try:
+                            user_ans = ui.prompt("Your answer (type 'done' to finish grilling)")
+                        except (KeyboardInterrupt, EOFError):
+                            ui.warn("Grill mode aborted.")
+                            break
+                        if user_ans.strip().lower() in ("done", "stop", "exit"):
+                            ui.success("Exiting grill mode.")
+                            break
+                        state.add_user(user_ans)
+
+                elif cmd == "/agents":
+                    subparts = rest.split(maxsplit=1)
+                    subcmd = subparts[0].lower() if subparts else "list"
+                    subrest = subparts[1] if len(subparts) > 1 else ""
+                    if subcmd in ("list", "show"):
+                        dashboard = orchestrator.format_dashboard()
+                        ui.panel("Orchestrator Agents Dashboard", dashboard)
+                    elif subcmd == "cancel":
+                        if not subrest:
+                            ui.warn("Usage: /agents cancel <agent_id>")
+                            continue
+                        aid = subrest.strip()
+                        if orchestrator.cancel_agent(aid):
+                            ui.success(f"Cancelled agent {aid}")
+                        else:
+                            ui.error(f"Agent {aid} not found or not active")
+                    elif subcmd == "spawn":
+                        if not subrest:
+                            ui.warn("Usage: /agents spawn <objective>")
+                            continue
+                        obj = subrest.strip()
+                        task = orchestrator.task_registry.create_task(
+                            objective=obj,
+                            session_id=state.session_id,
+                        )
+                        agent_inst = orchestrator.spawn_agent(
+                            task=task,
+                            system_prompt=cfg.cot_system_prompt,
+                            tool_registry=tool_registry,
+                        )
+                        def run_bg():
+                            loop = asyncio.get_event_loop()
+                            loop.create_task(orchestrator.run_agent(
+                                agent_inst.id,
+                                lambda hist, stream=False: vlm_complete(cfg, hist, stream=stream),
+                                ui=None,
+                            ))
+                        run_bg()
+                        ui.success(f"Spawned background agent {agent_inst.id} for task: {obj}")
+                    else:
+                        ui.warn("Usage: /agents [list|cancel <id>|spawn <objective>]")
+
+                elif cmd == "/tasks":
+                    subparts = rest.split(maxsplit=1)
+                    subcmd = subparts[0].lower() if subparts else "list"
+                    subrest = subparts[1] if len(subparts) > 1 else ""
+                    if subcmd in ("list", "show"):
+                        tasks = orchestrator.task_registry.tasks
+                        if not tasks:
+                            ui.info("No tasks recorded in this session.")
+                        else:
+                            lines = []
+                            lines.append(f"{'Task ID':<10} | {'Status':<12} | {'Agent ID':<15} | {'Objective'}")
+                            lines.append("─" * 80)
+                            for t in tasks:
+                                aid = t.agent_id or "—"
+                                obj = t.objective if len(t.objective) < 40 else t.objective[:37] + "..."
+                                lines.append(f"{t.id[:8]:<10} | {t.status.value:<12} | {aid:<15} | {obj}")
+                            ui.panel("Task Registry", "\n".join(lines))
+                    elif subcmd == "cancel":
+                        if not subrest:
+                            ui.warn("Usage: /tasks cancel <task_id>")
+                            continue
+                        tid = subrest.strip()
+                        matched_task = None
+                        for t in orchestrator.task_registry.tasks:
+                            if t.id == tid or t.id.startswith(tid):
+                                matched_task = t
+                                break
+                        if matched_task:
+                            orchestrator.task_registry.cancel_task(matched_task.id)
+                            if matched_task.agent_id:
+                                orchestrator.cancel_agent(matched_task.agent_id)
+                            ui.success(f"Cancelled task {matched_task.id}")
+                        else:
+                            ui.error(f"Task {tid} not found")
+                    elif subcmd == "inspect":
+                        if not subrest:
+                            ui.warn("Usage: /tasks inspect <task_id>")
+                            continue
+                        tid = subrest.strip()
+                        matched_task = None
+                        for t in orchestrator.task_registry.tasks:
+                            if t.id == tid or t.id.startswith(tid):
+                                matched_task = t
+                                break
+                        if matched_task:
+                            body = [
+                                f"Task ID    : {matched_task.id}",
+                                f"Objective  : {matched_task.objective}",
+                                f"Status     : {matched_task.status.value}",
+                                f"Agent ID   : {matched_task.agent_id or '—'}",
+                                f"Created At : {matched_task.created_at}",
+                                f"Updated At : {matched_task.updated_at}",
+                            ]
+                            if matched_task.result:
+                                body.append(f"Result     : {matched_task.result}")
+                            if matched_task.error:
+                                body.append(f"Error      : {matched_task.error}")
+                            if matched_task.artifacts:
+                                body.append("\nArtifacts:")
+                                for art in matched_task.artifacts:
+                                    body.append(f"  · {art.path} ({art.action})")
+                            ui.panel(f"Inspect Task {matched_task.id[:8]}", "\n".join(body))
+                        else:
+                            ui.error(f"Task {tid} not found")
+                    else:
+                        ui.warn("Usage: /tasks [list|cancel <id>|inspect <id>]")
+
+                elif cmd == "/browser":
+                    subparts = rest.split(maxsplit=1)
+                    subcmd = subparts[0].lower() if subparts else "status"
+                    if subcmd == "on":
+                        try:
+                            from playwright.sync_api import sync_playwright
+                            if not browser_state.get("playwright"):
+                                ui.info("Launching headless browser...")
+                                browser_state["playwright"] = sync_playwright().start()
+                                browser_state["browser"] = browser_state["playwright"].chromium.launch(headless=True)
+                                browser_state["page"] = browser_state["browser"].new_page()
+                                tool_registry._tools["browser_navigate"] = agent.ToolDefinition(
+                                    name="browser_navigate",
+                                    description="Navigate the browser to a given URL.",
+                                    parameters={"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]},
+                                    handler=handle_browser_navigate
+                                )
+                                tool_registry._tools["browser_screenshot"] = agent.ToolDefinition(
+                                    name="browser_screenshot",
+                                    description="Take a screenshot of the current browser page.",
+                                    parameters={"type": "object", "properties": {}},
+                                    handler=handle_browser_screenshot
+                                )
+                                tool_registry._tools["browser_extract_text"] = agent.ToolDefinition(
+                                    name="browser_extract_text",
+                                    description="Extract visible text from the browser page.",
+                                    parameters={"type": "object", "properties": {}},
+                                    handler=handle_browser_extract_text
+                                )
+                                ui.success("Browser is ON. Tools registered.")
+                            else:
+                                ui.info("Browser is already running.")
+                        except ImportError:
+                            ui.error("Playwright is not installed. Run: pip install playwright && playwright install")
+                        except Exception as e:
+                            ui.error(f"Failed to start browser: {e}")
+                    elif subcmd == "off":
+                        if browser_state.get("playwright"):
+                            ui.info("Closing browser session...")
+                            try:
+                                if browser_state.get("browser"):
+                                    browser_state["browser"].close()
+                                if browser_state.get("playwright"):
+                                    browser_state["playwright"].stop()
+                            except Exception:
+                                pass
+                            browser_state["playwright"] = None
+                            browser_state["browser"] = None
+                            browser_state["page"] = None
+                            tool_registry._tools.pop("browser_navigate", None)
+                            tool_registry._tools.pop("browser_screenshot", None)
+                            tool_registry._tools.pop("browser_extract_text", None)
+                            ui.success("Browser session closed. Tools unregistered.")
+                        else:
+                            ui.info("Browser is already OFF.")
+                    elif subcmd == "status":
+                        if browser_state.get("page"):
+                            try:
+                                url = browser_state["page"].url
+                                title = browser_state["page"].title()
+                                ui.info(f"Browser Status: ACTIVE\n  URL: {url}\n  Title: {title}")
+                            except Exception:
+                                ui.info("Browser Status: ACTIVE (Page not loaded)")
+                        else:
+                            ui.info("Browser Status: INACTIVE")
+                    else:
+                        url = rest.strip()
+                        if url:
+                            if not browser_state.get("page"):
+                                ui.info("Auto-turning ON browser...")
+                                try:
+                                    from playwright.sync_api import sync_playwright
+                                    browser_state["playwright"] = sync_playwright().start()
+                                    browser_state["browser"] = browser_state["playwright"].chromium.launch(headless=True)
+                                    browser_state["page"] = browser_state["browser"].new_page()
+                                    tool_registry._tools["browser_navigate"] = agent.ToolDefinition(
+                                        name="browser_navigate",
+                                        description="Navigate the browser to a given URL.",
+                                        parameters={"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]},
+                                        handler=handle_browser_navigate
+                                    )
+                                    tool_registry._tools["browser_screenshot"] = agent.ToolDefinition(
+                                        name="browser_screenshot",
+                                        description="Take a screenshot of the current browser page.",
+                                        parameters={"type": "object", "properties": {}},
+                                        handler=handle_browser_screenshot
+                                    )
+                                    tool_registry._tools["browser_extract_text"] = agent.ToolDefinition(
+                                        name="browser_extract_text",
+                                        description="Extract visible text from the browser page.",
+                                        parameters={"type": "object", "properties": {}},
+                                        handler=handle_browser_extract_text
+                                    )
+                                    ui.success("Browser turned ON.")
+                                except Exception as e:
+                                    ui.error(f"Failed to turn ON browser: {e}")
+                                    continue
+                            ui.info(f"Navigating to {url}...")
+                            res = handle_browser_navigate({"url": url}, agent.AgentRuntime(state=state, ui=ui))
+                            if res.status == "ok":
+                                ui.success(res.content)
+                            else:
+                                ui.error(res.content)
+                        else:
+                            ui.warn("Usage: /browser [on|off|<url>]")
+
+                elif cmd == "/fork":
+                    new_name = rest.strip()
+                    if not new_name:
+                        new_name = f"{state.chat_name}-fork"
+                    curr_sess = chatdb.get_session(conn, state.session_id)
+                    if not curr_sess:
+                        ui.error("Cannot fork: active session not loaded.")
+                        continue
+                    new_id = str(uuid.uuid4())
+                    now = chatdb.utc_now()
+                    try:
+                        columns = [
+                            "id", "chat_name", "status", "created_at", "updated_at", "started_at", "ended_at",
+                            "model", "host", "port", "temperature", "top_p", "max_tokens", "max_skill_chars",
+                            "max_context_tokens", "context_recompress_to", "system_prompt", "summary",
+                            "message_count", "user_turn_count", "assistant_turn_count", "tool_event_count",
+                            "last_message_at", "metadata_json"
+                        ]
+                        vals = []
+                        for col in columns:
+                            if col == "id":
+                                vals.append(new_id)
+                            elif col == "chat_name":
+                                vals.append(new_name)
+                            elif col in ("created_at", "updated_at"):
+                                vals.append(now)
+                            else:
+                                vals.append(curr_sess.get(col))
+                        placeholders = ", ".join([conn.placeholder] * len(columns))
+                        with chatdb._transaction(conn):
+                            conn.execute(
+                                f"INSERT INTO chat_sessions ({', '.join(columns)}) VALUES ({placeholders})",
+                                tuple(vals)
+                            )
+                            old_messages = chatdb.load_messages(conn, state.session_id)
+                            id_map = {}
+                            for msg in old_messages:
+                                parent_new_id = id_map.get(msg.get("parent_message_id")) if msg.get("parent_message_id") is not None else None
+                                msg_fields = {
+                                    "session_id": new_id,
+                                    "message_index": msg.get("message_index"),
+                                    "role": msg.get("role"),
+                                    "content_type": msg.get("content_type"),
+                                    "content_text": msg.get("content_text"),
+                                    "content_json": msg.get("content_json"),
+                                    "raw_request_json": msg.get("raw_request_json"),
+                                    "raw_response_json": msg.get("raw_response_json"),
+                                    "token_estimate": msg.get("token_estimate"),
+                                    "created_at": msg.get("created_at"),
+                                    "parent_message_id": parent_new_id,
+                                    "metadata_json": msg.get("metadata_json")
+                                }
+                                col_names = ", ".join(msg_fields.keys())
+                                p_holders = ", ".join([conn.placeholder] * len(msg_fields))
+                                cursor = conn.execute(
+                                    f"INSERT INTO chat_messages ({col_names}) VALUES ({p_holders})",
+                                    tuple(msg_fields.values())
+                                )
+                                if hasattr(cursor, "lastrowid"):
+                                    id_map[msg["id"]] = cursor.lastrowid
+                        session = chatdb.get_session(conn, new_id)
+                        state = _load_kernel_state(conn, session, cfg)
+                        ui.success(f"Session forked and switched to: {state.chat_name} (ID: {state.session_id})")
+                    except Exception as e:
+                        ui.error(f"Failed to fork session: {e}")
+
+                elif cmd in ("/rewind", "/undo"):
+                    try:
+                        n = int(rest.strip()) if rest.strip() else 1
+                    except ValueError:
+                        ui.warn("Usage: /rewind [<N>]")
+                        continue
+                    msgs = chatdb.load_messages(conn, state.session_id)
+                    if not msgs:
+                        ui.warn("No messages to rewind.")
+                        continue
+                    user_msgs = [m for m in msgs if m["role"] == "user"]
+                    if len(user_msgs) < n:
+                        ui.error(f"Cannot rewind {n} turns; only {len(user_msgs)} user turns exist.")
+                        continue
+                    target_user_msg = user_msgs[-n]
+                    target_index = target_user_msg["message_index"]
+                    with chatdb._transaction(conn):
+                        conn.execute(
+                            f"DELETE FROM chat_messages WHERE session_id = {conn.placeholder} AND message_index >= {conn.placeholder}",
+                            (state.session_id, target_index)
+                        )
+                        conn.execute(
+                            f"DELETE FROM chat_events WHERE session_id = {conn.placeholder} AND created_at >= {conn.placeholder}",
+                            (state.session_id, target_user_msg["created_at"])
+                        )
+                    remaining_msgs = chatdb.load_messages(conn, state.session_id)
+                    message_count = len(remaining_msgs)
+                    user_turn_count = len([m for m in remaining_msgs if m["role"] == "user"])
+                    assistant_turn_count = len([m for m in remaining_msgs if m["role"] == "assistant"])
+                    tool_event_count = len([m for m in remaining_msgs if m["role"] == "tool"])
+                    chatdb.update_session(
+                        conn,
+                        state.session_id,
+                        message_count=message_count,
+                        user_turn_count=user_turn_count,
+                        assistant_turn_count=assistant_turn_count,
+                        tool_event_count=tool_event_count
+                    )
+                    session = chatdb.get_session(conn, state.session_id)
+                    state = _load_kernel_state(conn, session, cfg)
+                    ui.success(f"Rewound {n} turn(s). Reverted to turn {state.turn}.")
+
+                elif cmd == "/rename":
+                    new_name = rest.strip()
+                    if not new_name:
+                        ui.warn("Usage: /rename <new_name>")
+                        continue
+                    state.session = dict(chatdb.update_session(conn, state.session_id, chat_name=new_name))
+                    ui.success(f"Session renamed to: {state.chat_name}")
+
+                elif cmd == "/btw":
+                    question = rest.strip()
+                    if not question:
+                        ui.warn("Usage: /btw <question>")
+                        continue
+                    ui.success(f"Dispatched background question: {question}")
+                    task = orchestrator.task_registry.create_task(
+                        objective=question,
+                        session_id=state.session_id,
+                        metadata={"btw": True}
+                    )
+                    agent_inst = orchestrator.spawn_agent(
+                        task=task,
+                        system_prompt=cfg.cot_system_prompt + "\nBe extremely concise. You are answering a side question.",
+                        tool_registry=tool_registry,
+                    )
+                    recent_history = [m for m in state.history if m["role"] != "system"][-6:]
+                    agent_inst.history = [{"role": "system", "content": agent_inst.system_prompt}] + recent_history + [{"role": "user", "content": question}]
+                    def run_btw_bg():
+                        async def run_and_notify():
+                            try:
+                                result = await orchestrator.run_agent(
+                                    agent_inst.id,
+                                    lambda hist, stream=False: vlm_complete(cfg, hist, stream=stream),
+                                    ui=None
+                                )
+                                print()
+                                ui.panel("Background Side-Question Answered", f"Q: {question}\n\nA: {result}")
+                            except Exception as e:
+                                print()
+                                ui.error(f"Background side-question failed: {e}")
+                        loop = asyncio.get_event_loop()
+                        loop.create_task(run_and_notify())
+                    run_btw_bg()
+
+                elif cmd == "/diff":
+                    path = rest.strip()
+                    workspace_root = os.getcwd()
+                    git_cmd = ["git", "diff"]
+                    if path:
+                        git_cmd.append(path)
+                    try:
+                        res = subprocess.run(
+                            git_cmd,
+                            capture_output=True,
+                            text=True,
+                            cwd=workspace_root,
+                            check=True
+                        )
+                        diff_output = res.stdout
+                        if not diff_output.strip():
+                            ui.info("No modifications in the current active workspace.")
+                        else:
+                            ui.rule(f"Git Diff {path}")
+                            ui.code(diff_output, lang="diff")
+                    except Exception as e:
+                        ui.error(f"Failed to generate git diff: {e}")
+
+                elif cmd == "/artifacts":
+                    all_artifacts = []
+                    for t in orchestrator.task_registry.tasks:
+                        for art in t.artifacts:
+                            all_artifacts.append((art.path, art.action, art.timestamp, t.id))
+                    if not all_artifacts:
+                        ui.info("No artifacts tracked in this session.")
+                    else:
+                        lines = []
+                        lines.append(f"{'Path':<40} | {'Action':<10} | {'Task ID':<10} | {'Timestamp'}")
+                        lines.append("─" * 80)
+                        for path, action, ts, tid in all_artifacts:
+                            lines.append(f"{path:<40} | {action:<10} | {tid[:8]:<10} | {ts}")
+                        ui.panel("Artifact Manager", "\n".join(lines))
+
+                elif cmd == "/add-dir":
+                    path = rest.strip()
+                    if not path:
+                        ui.warn("Usage: /add-dir <path>")
+                        continue
+                    resolved_path = os.path.abspath(path)
+                    if not os.path.exists(resolved_path):
+                        ui.error(f"Path does not exist: {resolved_path}")
+                        continue
+                    if not hasattr(state, "workspace_paths"):
+                        state.workspace_paths = [os.getcwd()]
+                    if resolved_path not in state.workspace_paths:
+                        state.workspace_paths.append(resolved_path)
+                    ui.success(f"Added directory to active workspace: {resolved_path}")
+                    state.inject_context(
+                        f"[WORKSPACE UPDATE] The directory {resolved_path} has been added to the active workspace. You are now permitted to access files in this directory.",
+                        source="workspace_update"
+                    )
+
+                elif cmd == "/context":
+                    subparts = rest.split(maxsplit=1)
+                    subcmd = subparts[0].lower() if subparts else "status"
+                    subrest = subparts[1] if len(subparts) > 1 else ""
+                    if not hasattr(state, "checkpoints"):
+                        state.checkpoints = {}
+                    if subcmd == "checkpoint":
+                        name = subrest.strip() or f"checkpoint_{len(state.checkpoints) + 1}"
+                        state.checkpoints[name] = {
+                            "history": list(state.history),
+                            "turn": state.turn,
+                            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+                        }
+                        ui.success(f"Checkpoint '{name}' created at turn {state.turn}.")
+                    elif subcmd == "restore":
+                        name = subrest.strip()
+                        if not name:
+                            ui.warn("Usage: /context restore <name>")
+                            continue
+                        if name not in state.checkpoints:
+                            ui.error(f"Checkpoint '{name}' not found.")
+                            continue
+                        chk = state.checkpoints[name]
+                        state.history = list(chk["history"])
+                        state.turn = chk["turn"]
+                        ui.success(f"Restored to checkpoint '{name}' (turn {state.turn}).")
+                    elif subcmd == "clear":
+                        state.checkpoints = {}
+                        ui.success("All checkpoints cleared.")
+                    elif subcmd in ("status", "list"):
+                        total_budget = cfg.max_context_tokens
+                        user_len = sum(len(json.dumps(m["content"])) for m in state.history if m["role"] == "user")
+                        assistant_len = sum(len(m["content"]) for m in state.history if m["role"] == "assistant")
+                        system_len = sum(len(m["content"]) for m in state.history if m["role"] == "system")
+                        user_tokens = user_len // 4
+                        assistant_tokens = assistant_len // 4
+                        system_tokens = system_len // 4
+                        total_used = user_tokens + assistant_tokens + system_tokens
+                        user_pct = user_tokens / total_budget if total_budget > 0 else 0
+                        assistant_pct = assistant_tokens / total_budget if total_budget > 0 else 0
+                        system_pct = system_tokens / total_budget if total_budget > 0 else 0
+                        total_used_pct = total_used / total_budget if total_budget > 0 else 0
+                        grid_str = render_token_grid(total_used_pct, user_pct, assistant_pct, 0.05, system_pct)
+                        panel_body = f"""{grid_str}
+
+Model: {cfg.model}
+Total usage: {total_used:,}/{total_budget:,} tokens ({total_used_pct*100:.1f}%)
+
+Token usage by category:
+  ● User messages: {user_tokens:,} tokens ({user_pct*100:.1f}%)
+  ● Agent responses: {assistant_tokens:,} tokens ({assistant_pct*100:.1f}%)
+  ● System prompt: {system_tokens:,} tokens ({system_pct*100:.1f}%)
+  ● Free space: {max(0, total_budget - total_used):,} tokens ({(1-total_used_pct)*100:.1f}%)
+
+Checkpoints ({len(state.checkpoints)}):
+"""
+                        for name, chk in state.checkpoints.items():
+                            panel_body += f"  · {name} (turn {chk['turn']}) - {chk['timestamp']}\n"
+                        ui.panel("Context & Token Usage Analytics", panel_body)
+                    else:
+                        ui.warn("Usage: /context [checkpoint <name>|restore <name>|clear|status]")
+
+                elif cmd == "/usage":
+                    try:
+                        query = """
+                            SELECT 
+                                model, 
+                                COUNT(*) as session_count, 
+                                SUM(message_count) as total_messages,
+                                SUM(user_turn_count) as total_user_turns,
+                                SUM(assistant_turn_count) as total_assistant_turns
+                            FROM chat_sessions 
+                            GROUP BY model
+                        """
+                        rows = chatdb._query_all(conn, query, ())
+                        if not rows:
+                            ui.info("No usage stats recorded yet.")
+                        else:
+                            body = []
+                            body.append(f"{'Model':<40} | {'Sessions':<10} | {'Messages':<10} | {'User Turns':<10} | {'Agent Turns'}")
+                            body.append("─" * 85)
+                            for r in rows:
+                                model = r.get("model") or "unknown"
+                                body.append(f"{model:<40} | {r.get('session_count'):<10} | {r.get('total_messages'):<10} | {r.get('total_user_turns'):<10} | {r.get('total_assistant_turns')}")
+                            ui.panel("Model Usage Statistics", "\n".join(body))
+                    except Exception as e:
+                        ui.error(f"Failed to query usage statistics: {e}")
+
+                elif cmd == "/export":
+                    subparts = rest.split(maxsplit=1)
+                    format_type = subparts[0].lower() if subparts else "json"
+                    dest = subparts[1].strip() if len(subparts) > 1 else ""
                     export_payload = {
                         "session": state.session,
                         "history": state.history,
                     }
-                    pathlib.Path(fname).write_text(
-                        json.dumps(export_payload, indent=2, default=str)
-                    )
-                    ui.success(f"Saved → {fname}")
-
+                    if format_type == "json":
+                        fname = dest or f"export_session_{state.session_id[:8]}.json"
+                        try:
+                            pathlib.Path(fname).write_text(
+                                json.dumps(export_payload, indent=2, default=str)
+                            )
+                            ui.success(f"Session successfully exported to JSON: {fname}")
+                        except Exception as e:
+                            ui.error(f"Failed to write JSON export: {e}")
+                    elif format_type == "markdown":
+                        fname = dest or f"export_session_{state.session_id[:8]}.md"
+                        try:
+                            lines = [f"# Session: {state.chat_name}", f"ID: {state.session_id}", ""]
+                            for msg in state.history:
+                                role = msg["role"].upper()
+                                content = msg["content"]
+                                if isinstance(content, list):
+                                    content = "\n".join(
+                                        c.get("text", "") for c in content if c.get("type") == "text"
+                                    )
+                                lines.append(f"### {role}")
+                                lines.append(f"{content}")
+                                lines.append("")
+                            pathlib.Path(fname).write_text("\n".join(lines))
+                            ui.success(f"Session successfully exported to Markdown: {fname}")
+                        except Exception as e:
+                            ui.error(f"Failed to write Markdown export: {e}")
+                    elif format_type == "push":
+                        gui_url = dest or "http://localhost:7878/api/session/import"
+                        ui.info(f"Pushing session to Antigravity GUI at {gui_url}...")
+                        try:
+                            resp = requests.post(gui_url, json=export_payload, timeout=5)
+                            if resp.status_code == 200:
+                                ui.success("Successfully pushed session to Antigravity GUI.")
+                            else:
+                                ui.error(f"GUI returned error: {resp.status_code} - {resp.text}")
+                        except Exception as e:
+                            ui.error(f"Could not connect to GUI endpoint: {e}")
+                    else:
+                        ui.warn("Usage: /export [json|markdown|push] [<destination>]")
+                    
                 else:
                     ui.warn(f"Unknown command: {cmd}  — type /help")
 
@@ -1661,11 +3114,33 @@ def cmd_kernel(cfg: ServerConfig, db_settings: chatdb.DatabaseSettings, session_
 
             # ── Normal user turn → VLM completion ───────────────────────────
             state.next_actions = []
-            state.add_user(submission.raw, state.pending_image)
+            
+            resolved_msg = submission.raw
+            import re
+            attachments = []
+            for match in set(re.findall(r'(?<!\S)@([^\s]+)', submission.raw)):
+                path = match.strip()
+                p = pathlib.Path(path)
+                if p.exists() and p.is_file():
+                    try:
+                        content = p.read_text(encoding="utf-8", errors="replace")
+                        if len(content) > cfg.max_skill_chars:
+                            content = content[:cfg.max_skill_chars] + "\n\n[... truncated ...]"
+                        attachments.append(f'<file path="{path}">\n{content}\n</file>')
+                    except Exception as e:
+                        ui.warn(f"Failed to attach {path}: {e}")
+                        
+            if attachments:
+                resolved_msg += "\n\n[Attached Context:]\n" + "\n\n".join(attachments)
+
+            state.add_user(resolved_msg, state.pending_image)
             state.compact_history_if_needed()
 
             ui.rule(f"turn {state.turn} · agent response")
             t0 = time.perf_counter()
+            
+            def status_callback(event: agent.StatusEvent):
+                ui.start_status(event.message)
 
             try:
                 reply = agent.run_agent_loop(
@@ -1673,6 +3148,7 @@ def cmd_kernel(cfg: ServerConfig, db_settings: chatdb.DatabaseSettings, session_
                     complete_fn=vlm_complete,
                     ui=ui,
                     registry=tool_registry,
+                    status_callback=status_callback,
                 )
             except KeyboardInterrupt:
                 ui.warn("Interrupted current run; returning to the kernel prompt.")
@@ -1680,6 +3156,8 @@ def cmd_kernel(cfg: ServerConfig, db_settings: chatdb.DatabaseSettings, session_
             except Exception as e:
                 ui.error(f"VLM error: {e}")
                 continue
+            finally:
+                ui.stop_status()
 
             elapsed = time.perf_counter() - t0
 
@@ -1802,6 +3280,12 @@ def build_parser() -> argparse.ArgumentParser:
         chatdb.add_db_selection_args(parser, suppress_defaults=suppress_defaults)
         parser.add_argument("--session-id", default=default, dest="session_id",
                             help="Resume a specific chat session UUID")
+        parser.add_argument("--profile", default=default, dest="profile",
+                            help="Named config profile to load from config.jsonc")
+        parser.add_argument("--quantize",    action="store_true", default=default,
+                            help="Enable runtime model quantization check and conversion")
+        parser.add_argument("--q-bits",      default=default, help="Target bits for quantization (8, 4, 3, 2, or auto)")
+        parser.add_argument("--cache-dir",   default=default, help="Output folder for quantized weights")
 
     # Accept globals before the command.
     add_global_overrides(p)
@@ -1814,7 +3298,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_global_overrides(sub_common, suppress_defaults=True)
 
     # serve
-    sub.add_parser("serve", help="Start mlx_vlm.server with inlined config params",
+    sub.add_parser("serve", help="Start the local MLX server (mlx_vlm or mlx_lm) with inlined config params",
                    parents=[sub_common])
 
     # extract
@@ -1842,7 +3326,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main():
     parser = build_parser()
-    args   = parser.parse_args()
+    args, extras = parser.parse_known_args()
 
     # ── Apply global overrides to ServerConfig ────────────────────────────────
     cfg = ServerConfig()
@@ -1860,6 +3344,73 @@ def main():
         cfg.context_recompress_to = args.context_recompress_to
     if args.metadata_base_url is not None:
         cfg.metadata_base_url = args.metadata_base_url
+    if getattr(args, "quantize", False):
+        cfg.quantize = True
+    if getattr(args, "q_bits", None) is not None:
+        cfg.q_bits = args.q_bits
+    if getattr(args, "cache_dir", None) is not None:
+        cfg.cache_dir = args.cache_dir
+
+    # Process inline key-value pairs (e.g. model=xxx or other_key=val)
+    unrecognized = []
+    for extra in extras:
+        if "=" not in extra:
+            unrecognized.append(extra)
+        else:
+            key, val = extra.split("=", 1)
+            key_norm = key.strip().lower().replace("-", "_")
+            if key.startswith("-") or not hasattr(cfg, key_norm) or key_norm.startswith("_"):
+                unrecognized.append(extra)
+            else:
+                orig_val = getattr(cfg, key_norm)
+                try:
+                    if isinstance(orig_val, bool):
+                        setattr(cfg, key_norm, val.strip().lower() in ("true", "1", "yes"))
+                    elif isinstance(orig_val, int):
+                        setattr(cfg, key_norm, int(val.strip()))
+                    elif isinstance(orig_val, float):
+                        setattr(cfg, key_norm, float(val.strip()))
+                    else:
+                        setattr(cfg, key_norm, val.strip())
+                except Exception:
+                    setattr(cfg, key_norm, val.strip())
+
+    if unrecognized:
+        parser.error(f"unrecognized arguments: {' '.join(unrecognized)}")
+
+    if cfg.quantize:
+        # Resolve target q_bits
+        q_bits_str = str(cfg.q_bits).strip().lower()
+        if q_bits_str == "auto" or not q_bits_str:
+            q_bits = determine_optimal_q_bits(cfg.model)
+        else:
+            try:
+                q_bits = int(q_bits_str)
+            except ValueError:
+                q_bits = 4
+                ui.warn(f"Invalid q_bits value '{cfg.q_bits}'; defaulting to 4-bit.")
+
+        # Resolve cache dir
+        if cfg.cache_dir:
+            target_cache = pathlib.Path(cfg.cache_dir)
+        else:
+            safe_model_name = cfg.model.replace("/", "--")
+            target_cache = chatdb.default_config_dir() / "quantized" / safe_model_name / f"{q_bits}bit"
+
+        # Check if already quantized
+        if pathlib.Path(cfg.model).is_dir():
+            ui.info(f"Model is a local directory: {cfg.model}. Skipping runtime quantization.")
+        elif (target_cache / "config.json").exists():
+            ui.info(f"Using cached {q_bits}-bit quantized model: {target_cache}")
+            cfg.model = str(target_cache)
+        else:
+            ui.info(f"Model {cfg.model} needs {q_bits}-bit quantization. Starting converter...")
+            try:
+                run_quantization(cfg.model, q_bits, target_cache)
+                cfg.model = str(target_cache)
+            except Exception as e:
+                ui.error(f"Failed to perform runtime quantization: {e}")
+                sys.exit(1)
 
     if cfg.context_recompress_to > cfg.max_context_tokens:
         ui.warn(
@@ -1888,7 +3439,7 @@ def main():
             db_settings = chatdb.resolve_db_settings_from_args(args, use_config=True)
         except ValueError as exc:
             parser.error(str(exc))
-        cmd_kernel(cfg, db_settings, args.session_id)
+        cmd_kernel(cfg, db_settings, args.session_id, profile=args.profile)
 
     elif args.command == "list-skills":
         cmd_list_skills(args.root)

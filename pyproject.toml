@@ -9,6 +9,8 @@ description = "An open-anything inspried Multi-purpose Working Layer—specifci 
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
+    "build>=1.5.1",
+    "mlx-lm>=0.31.1",
     "mlx-vlm>=0.4.4",
     "prompt-toolkit>=3.0.52",
     "psycopg>=3.2.0",

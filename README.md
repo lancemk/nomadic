@@ -9,8 +9,10 @@
 The project combines:
 
 - an interactive agent-first kernel
-- local multimodal prompting through `mlx_vlm.server`
-- structured tool-calling for file reading, shell execution, and metadata search
+- local multimodal prompting through `mlx_vlm.server` (and `mlx_lm.server` for text-only models)
+- structured tool-calling for file reading, shell execution, metadata search, and headless browsing
+- multi-agent orchestration with human-in-the-loop safety review
+- a persistent task registry for tracking objectives across a session
 - persistent session storage in SQLite or Postgres
 - lightweight prompt, context, and conversation management in one place
 
@@ -69,12 +71,36 @@ Inside `kernel`, you currently get:
 - `/tokens <n>` to change response budget
 - `/clear` to clear the active history
 - `/save <file>` to export the conversation as JSON
+- `/preset`, `/profile`, `/template` for reusable prompt and workspace configuration
+- `/chat list` / `/resume <id|name>` to inventory and switch between sessions
+
+Multi-agent orchestration and task management:
+
+- `/goal <objective>` to run an agent to completion against an objective, using the active safety profile
+- `/go` to let the agent continue acting on the current context without waiting on the next prompt
+- `/agents` to inspect and cancel parallel background agent instances
+- `/tasks [list|cancel <id>|inspect <id>]` / `/task` to inspect the persistent task registry
+- `/review` and `/safety` to inspect and change human-in-the-loop review policy
+- `/fork` to duplicate the active session into a new one
+- `/rewind` / `/undo` to roll back recent history
+- `/rename` to rename the active session
+
+Workspace, browsing, and developer ergonomics:
+
+- `/browser on|off` to launch a headless Chromium instance (via Playwright, optional dependency) and register browser tools
+- `/btw <question>` to run an isolated background side-question without disrupting the main conversation
+- `/add-dir <path>` to expand the agent's allowed workspace boundary at runtime
+- `/diff` to render a unified git diff of the active workspace
+- `/artifacts` to inspect files agents have generated
+- `/context` to see a token-budget breakdown of the active session
+- `/usage` and `/export` for session stats and serialization
 
 The default structured tool registry currently includes:
 
 - `read_skill`
 - `exec_shell`
 - `metadata_search`
+- `browser_navigate`, `browser_screenshot`, `browser_extract_text` (registered once `/browser on` is run)
 
 ## Why This Exists
 
@@ -99,9 +125,10 @@ Current practical target environment:
 
 - macOS on Apple Silicon
 - Python 3.14+
-- `mlx-vlm`
+- `mlx-vlm` and `mlx-lm` (text-only models are routed to `mlx_lm.server` automatically)
 - `requests`
-- local model artifacts compatible with the selected MLX VLM server flow
+- local model artifacts compatible with the selected MLX server flow
+- `playwright` (optional, only needed for `/browser`)
 
 The project metadata is still evolving, so for now the safest install path is to install runtime dependencies explicitly.
 
@@ -277,59 +304,33 @@ The scope of `nomadic` is broader than the current implementation. Below is the 
 
 ### Milestone 0: Foundation
 
-- [x] Core Python CLI structure
-- [x] Local `mlx_vlm.server` launcher
-- [x] Interactive kernel command
-- [x] One-shot `SKILL.md` extraction flow
-- [x] Basic local tool-calling loop
+*(Completed features are tracked in [CHANGELOG.md](CHANGELOG.md))*
 
 ### Milestone 1: Agent REPL Baseline
 
-- [x] REPL-style terminal interaction
-- [x] Built-in slash commands
-- [x] Multiline input support when `prompt_toolkit` is installed
-- [x] Interrupt handling with safe kernel return
-- [x] Suggested next-step menu after responses
+*(Completed features are tracked in [CHANGELOG.md](CHANGELOG.md))*
 
 ### Milestone 2: Session Persistence
 
-- [x] Persistent chat session model
-- [x] Session/message/event schema
-- [x] Resume by session UUID
-- [x] Auto-title from first meaningful user turn
-- [x] SQLite backend
-- [x] Postgres backend
-- [x] Config-driven database initialization
+*(Completed features are tracked in [CHANGELOG.md](CHANGELOG.md))*
 
 ### Milestone 3: Local Tooling Layer
 
-- [x] `read_skill`
-- [x] `exec_shell`
-- [x] `metadata_search`
-- [ ] richer tool registry management
-- [ ] tool permissions and safety profiles
-- [ ] user-defined local tool packs
+*(Completed features are tracked in [CHANGELOG.md](CHANGELOG.md))*
 
 ### Milestone 4: Prompting and Context Ops
 
-- [x] history compression
-- [x] runtime prompt controls for temperature and token budget
-- [ ] reusable prompt presets
-- [ ] named workspaces and profiles
-- [ ] prompt templates for common agent tasks
-- [ ] better session summarization and memory shaping
+*(Completed features are tracked in [CHANGELOG.md](CHANGELOG.md))*
 
 ### Milestone 5: Personal Agent Workspace
 
-- [ ] project-aware working directories
-- [ ] persistent task boards / objectives
-- [ ] artifact tracking across sessions
+*(Completed features are tracked in [CHANGELOG.md](CHANGELOG.md))*
 - [ ] file-centric workflows beyond `SKILL.md`
 - [ ] tighter personal knowledge ingestion
 
 ### Milestone 6: Multimodal and Retrieval Expansion
 
-- [x] image attachment to user turns
+*(Completed features are tracked in [CHANGELOG.md](CHANGELOG.md))*
 - [ ] richer vision workflows
 - [ ] retrieval adapters beyond the current metadata service
 - [ ] local vector / index integrations
@@ -337,16 +338,15 @@ The scope of `nomadic` is broader than the current implementation. Below is the 
 
 ### Milestone 7: OSS Hardening
 
-- [x] basic test coverage
+*(Completed features are tracked in [CHANGELOG.md](CHANGELOG.md))*
 - [ ] package metadata polish
 - [ ] public docs expansion
 - [ ] contributor workflow and issue templates
-- [ ] release automation
 - [ ] API stability and semantic versioning discipline
 
 ### Milestone 8: Platform Expansion
 
-- [x] Apple Silicon baseline
+*(Completed features are tracked in [CHANGELOG.md](CHANGELOG.md))*
 - [ ] Linux support investigation
 - [ ] Intel macOS feasibility review
 - [ ] Windows support investigation
@@ -355,8 +355,8 @@ The scope of `nomadic` is broader than the current implementation. Below is the 
 
 ### Milestone 9: Agent Platform Direction
 
+*(Completed features are tracked in [CHANGELOG.md](CHANGELOG.md))*
 - [ ] pluggable tool registries
-- [ ] multi-agent orchestration patterns
 - [ ] remote execution adapters
 - [ ] richer session analytics and evaluation
 - [ ] portable agent workspace format
@@ -368,14 +368,17 @@ The project is still early-stage.
 The completed work is mostly in:
 
 - the terminal kernel loop
-- the structured local tool-calling foundation
+- the structured local tool-calling foundation, including an optional headless browser tool
 - `SKILL.md` ingestion
-- session persistence
+- session persistence, forking, and rewind
 - database initialization and backend selection
 - context compression
-- basic tests around kernel input, metadata search, and DB behavior
+- multi-agent orchestration with a human-in-the-loop safety review layer
+- a persistent, DB-backed task registry
+- release automation, including standalone PyInstaller binaries
+- basic tests around kernel input, metadata search, DB behavior, and the orchestration/HITL/task surface
 
-That is a meaningful base, but it is still much closer to **a strong prototype and working personal tool** than a finished general-purpose agent platform.
+That is a meaningful base. The orchestration and HITL layer in particular puts `nomadic` closer to a genuine local multi-agent platform than the earlier single-agent REPL prototype, but it is still young: those subsystems are largely undocumented outside `specs/`, unstaged/uncommitted for stretches at a time, and not yet exercised by the same depth of test coverage as the core kernel loop.
 
 ## Near-Term Next Features
 
@@ -383,10 +386,9 @@ The most natural next steps from the current state are:
 
 1. Package polish and public OSS hygiene.
 2. Contribution, security, and release docs.
-3. Expanded tool registry and safer tool execution controls.
-4. More robust prompt presets and reusable workspace profiles.
-5. Better retrieval and memory integrations.
-6. Improved export, artifact, and task-management workflows.
+3. Test coverage for the orchestrator, HITL manager, and task registry proportional to the core kernel loop's.
+4. Better retrieval and memory integrations.
+5. Pluggable tool registries and remote execution adapters (Milestone 9 remainder).
 
 ## Philosophy
 

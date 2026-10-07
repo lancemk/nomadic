@@ -10,6 +10,21 @@ These sections use stable markers keyed by PR number and merge commit SHA so
 reruns remain idempotent.
 <!-- nomadic:changelog-anchor -->
 
+## [0.3.0] - 2026-10-07
+<!-- nomadic:changelog pr=2 merge=ebbda985f62addb4ec8f092bded7684a3ba66d00 version=0.3.0 generated=2026-10-07 -->
+
+Target Branch: `main`
+PR: `#2` feat: standalone CD/CI release pipeline, install.sh, and client file layout (0.2.0)
+
+### Commits
+- `e69c2ec` Add multi-agent orchestration, HITL safety review, and task registry
+- `f92ee75` Ignore local build scratch and session dump files
+- `90fc6cf` Document orchestration, HITL, task registry, and browser tooling
+- `8da666e` Fix crash on null model response; add /model selection menu
+- `8ef53f0` feat: standalone CD/CI release pipeline, install.sh, and client file layout
+- `43d2b0c` Merge branch 'main' into develop
+
+
 ## [0.2.0] - 2026-10-07
 
 Project re-vitalization (minor bump; pre-1.0, so the default database location change ships here with upgrade notes in the README): feature log compacted by capability area, release pipeline reconciled end to end.

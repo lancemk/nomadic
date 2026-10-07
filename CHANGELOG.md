@@ -10,8 +10,6 @@ These sections use stable markers keyed by PR number and merge commit SHA so
 reruns remain idempotent.
 <!-- nomadic:changelog-anchor -->
 
-## [Unreleased]
-
 ## [0.2.0] - 2026-10-07
 
 Project re-vitalization (minor bump; pre-1.0, so the default database location change ships here with upgrade notes in the README): feature log compacted by capability area, release pipeline reconciled end to end.
@@ -49,3 +47,14 @@ Foundation release (milestones 0-8 baseline):
 - **Tools**: `read_skill`, `exec_shell`, `metadata_search`, dynamic tool registry, user tool packs in `~/.config/nomadic/tools`.
 - **Context ops**: history compression with VLM-generated memory, `/temp` and `/tokens`, `/preset`, `/profile`, `/template`, image attachment.
 - **Hardening**: unit tests, release automation, Apple Silicon baseline.
+## [0.1.1] - 2026-05-16
+<!-- nomadic:changelog pr=1 merge=ee842d5b9df82f842666b4e2b8d2a02a2ef30796 version=0.1.1 generated=2026-05-16 -->
+
+Target Branch: `main`
+PR: `#1` Modify into nomadic/ and Add Postgres Container Middleware; GitHub CI…
+
+### Commits
+- `7346b81` Modify into nomadic/ and Add Postgres Container Middleware; GitHub CI/CD and Branch-Aware Release Automation; Refactor GH Workflow Triggers and Post-Merge Versioning
+
+
+## [0.1.0.0] - 2026-05-16

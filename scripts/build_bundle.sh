@@ -3,6 +3,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/release_env.sh
 source "${SCRIPT_DIR}/release_env.sh"
 
 REPO_ROOT="$(nomadic_repo_root)"
@@ -47,14 +48,30 @@ cp "${REPO_ROOT}/LICENSE.md" "${BUNDLE_ROOT}/"
 cp "${REPO_ROOT}/GUIDE.md" "${BUNDLE_ROOT}/docs/"
 cp "${REPO_ROOT}/nomadic/sql/"*.sql "${BUNDLE_ROOT}/sql/"
 
-cat > "${BUNDLE_ROOT}/install.sh" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
+REQUIRE_BINARIES="${NOMADIC_REQUIRE_BINARIES:-0}"
+if python3 -c "import PyInstaller" >/dev/null 2>&1; then
+  printf 'Building standalone CLI executables via PyInstaller...\n'
+  mkdir -p "${BUNDLE_ROOT}/bin"
+  STAMP="${REPO_ROOT}/nomadic/_version.py"
+  printf '__version__ = "%s"\n' "${VERSION}" > "${STAMP}"
+  trap 'rm -f "${STAMP}"' EXIT
+  PYI_COMMON=(--onefile --clean --noconfirm
+    --collect-all psycopg --collect-all psycopg_binary
+    --add-data "${REPO_ROOT}/nomadic/sql:nomadic/sql"
+    --workpath "${TMP_ROOT}/build" --distpath "${BUNDLE_ROOT}/bin" --specpath "${TMP_ROOT}")
+  python3 -m PyInstaller "${PYI_COMMON[@]}" --name nomadic "${REPO_ROOT}/nomadic_bin.py"
+  python3 -m PyInstaller "${PYI_COMMON[@]}" --name nomadic-db "${REPO_ROOT}/db.py"
+  # Smoke test: a binary that cannot report its version must never ship.
+  "${BUNDLE_ROOT}/bin/nomadic" --version
+  printf 'Standalone CLI executables built successfully.\n'
+elif [[ "${REQUIRE_BINARIES}" == "1" ]]; then
+  printf 'NOMADIC_REQUIRE_BINARIES=1 but PyInstaller is not installed.\n' >&2
+  exit 1
+else
+  printf 'PyInstaller not found. Skipping standalone binary compilation.\n'
+fi
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-python3 -m pip install "${SCRIPT_DIR}"/dist/nomadic-*.whl
-printf 'Installed nomadic from bundled wheel.\n'
-EOF
+cp "${REPO_ROOT}/install.sh" "${BUNDLE_ROOT}/install.sh"
 chmod +x "${BUNDLE_ROOT}/install.sh"
 
 cat > "${BUNDLE_ROOT}/BUILD_INFO.txt" <<EOF
@@ -73,4 +90,11 @@ EOF
   tar -czf "${ARCHIVE_PATH}" "${BUNDLE_STEM}"
 )
 
+if command -v sha256sum >/dev/null 2>&1; then
+  (cd "${ARTIFACT_DIR}" && sha256sum "${BUNDLE_STEM}.tar.gz" > "${BUNDLE_STEM}.tar.gz.sha256")
+else
+  (cd "${ARTIFACT_DIR}" && shasum -a 256 "${BUNDLE_STEM}.tar.gz" > "${BUNDLE_STEM}.tar.gz.sha256")
+fi
+
 printf '%s\n' "${ARCHIVE_PATH}"
+

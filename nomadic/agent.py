@@ -3,13 +3,29 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import pathlib
 import subprocess
 from dataclasses import dataclass, field
-from typing import Any, Callable, Mapping, Optional
+from enum import Enum
+from typing import Any, Callable, Mapping, Optional, List
 
 from .search import metadata as metadata_search
+
+class LifecycleState(Enum):
+    THINKING = "thinking"
+    READING = "reading"
+    WRITING = "writing"
+    EDITING = "editing"
+    EXECUTING = "executing"
+    REVIEWING = "reviewing"
+
+@dataclass(frozen=True)
+class StatusEvent:
+    state: LifecycleState
+    message: str
+    depth: int = 0
 
 DEFAULT_AGENT_MAX_DEPTH = 5
 DEFAULT_SHELL_TIMEOUT_SECONDS = 30
@@ -45,6 +61,7 @@ class AgentRuntime:
     loop_depth: int = 0
     shell_timeout_seconds: int = DEFAULT_SHELL_TIMEOUT_SECONDS
     max_tool_output_chars: int = DEFAULT_TOOL_OUTPUT_CHARS
+    status_callback: Callable[[StatusEvent], None] | None = None
 
     @property
     def max_skill_chars(self) -> int:
@@ -193,6 +210,86 @@ def _render_exec_shell_result(payload: Mapping[str, Any]) -> str:
 def _render_metadata_search_result(payload: Mapping[str, Any]) -> str:
     return metadata_search.render_metadata_search_result(dict(payload))
 
+def _handle_read_file(arguments: Mapping[str, Any], runtime: AgentRuntime) -> ToolExecutionResult:
+    path = arguments.get("path")
+    if not isinstance(path, str) or not path.strip():
+        raise ValueError("read_file requires a string path")
+    start_line = arguments.get("start_line")
+    end_line = arguments.get("end_line")
+    
+    p = pathlib.Path(path.strip())
+    if not p.exists():
+        raise FileNotFoundError(f"File not found: {p}")
+        
+    lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+    if isinstance(start_line, int) and isinstance(end_line, int):
+        content = "\n".join(lines[start_line-1:end_line])
+    else:
+        content = "\n".join(lines)
+        
+    if len(content) > runtime.max_skill_chars:
+        content = content[:runtime.max_skill_chars] + "\n\n[... truncated ...]"
+        
+    return ToolExecutionResult(
+        tool_name="read_file",
+        label=f"read_file: {path}",
+        status="ok",
+        content=f"Path: {path}\nContent:\n{content}",
+        payload={"path": path, "content": content},
+    )
+
+def _handle_write_file(arguments: Mapping[str, Any], runtime: AgentRuntime) -> ToolExecutionResult:
+    path = arguments.get("path")
+    content = arguments.get("content")
+    if not path or not isinstance(content, str):
+        raise ValueError("write_file requires path and content")
+    p = pathlib.Path(path.strip())
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(content, encoding="utf-8")
+    return ToolExecutionResult(
+        tool_name="write_file",
+        label=f"write_file: {path}",
+        status="ok",
+        content=f"Successfully wrote to {path}",
+        payload={"path": str(path)}
+    )
+
+def _handle_replace_content(arguments: Mapping[str, Any], runtime: AgentRuntime) -> ToolExecutionResult:
+    path = arguments.get("path")
+    target = arguments.get("target")
+    replacement = arguments.get("replacement")
+    if not path or not target or type(replacement) is not str:
+        raise ValueError("replace_content requires path, target, and replacement")
+    p = pathlib.Path(path.strip())
+    if not p.exists():
+        raise FileNotFoundError(f"File not found: {p}")
+    text = p.read_text(encoding="utf-8")
+    if target not in text:
+        raise ValueError("Target string not found in file")
+    text = text.replace(target, replacement)
+    p.write_text(text, encoding="utf-8")
+    return ToolExecutionResult(
+        tool_name="replace_content",
+        label=f"replace_content: {path}",
+        status="ok",
+        content=f"Successfully replaced content in {path}",
+        payload={"path": str(path)}
+    )
+
+def _handle_list_dir(arguments: Mapping[str, Any], runtime: AgentRuntime) -> ToolExecutionResult:
+    path = arguments.get("path", ".")
+    p = pathlib.Path(path.strip())
+    if not p.exists() or not p.is_dir():
+        raise FileNotFoundError(f"Directory not found: {p}")
+    items = sorted([str(item.relative_to(p)) for item in p.rglob("*") if item.is_file()])
+    return ToolExecutionResult(
+        tool_name="list_dir",
+        label=f"list_dir: {path}",
+        status="ok",
+        content=f"Directory contents of {path} (recursive files):\n" + "\n".join(items[:500]),
+        payload={"path": str(path)}
+    )
+
 
 def _handle_read_skill(arguments: Mapping[str, Any], runtime: AgentRuntime) -> ToolExecutionResult:
     path = arguments.get("path")
@@ -231,10 +328,12 @@ def _handle_exec_shell(arguments: Mapping[str, Any], runtime: AgentRuntime) -> T
 def _handle_metadata_search(arguments: Mapping[str, Any], runtime: AgentRuntime) -> ToolExecutionResult:
     query = arguments.get("query")
     limit = arguments.get("limit")
+    if not isinstance(query, str) or not query.strip():
+        raise ValueError("metadata_search requires a non-empty string argument: query")
 
     payload = metadata_search.search_metadata(
-        query,
-        limit=limit,
+        query=query.strip(),
+        limit=limit if isinstance(limit, int) else 5,
         base_url=runtime.metadata_base_url,
     )
     status = "ok" if payload.get("ok") else "error"
@@ -258,6 +357,43 @@ class ToolRegistry:
     def tools(self) -> list[ToolDefinition]:
         return list(self._tools.values())
 
+    def register(self, tool: ToolDefinition):
+        """Add a new tool to the registry."""
+        self._tools[tool.name] = tool
+
+    def unregister(self, name: str):
+        """Remove a tool from the registry."""
+        if name in self._tools:
+            del self._tools[name]
+
+    def load_from_directory(self, directory: str | pathlib.Path):
+        """
+        Scan a directory for .py files and load ToolDefinitions from them.
+        Expects a module-level `get_tools` function that returns List[ToolDefinition].
+        """
+        path = pathlib.Path(directory).expanduser()
+        if not path.exists() or not path.is_dir():
+            return
+
+        for py_file in path.glob("*.py"):
+            if py_file.name == "__init__.py":
+                continue
+            
+            try:
+                module_name = f"nomadic.tools.{py_file.stem}"
+                spec = importlib.util.spec_from_file_location(module_name, py_file)
+                if spec and spec.loader:
+                    module = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(module)
+                    if hasattr(module, "get_tools"):
+                        tools = module.get_tools()
+                        for tool in tools:
+                            if isinstance(tool, ToolDefinition):
+                                self.register(tool)
+            except Exception:
+                # In a real tool, we might want to log this to the UI
+                pass
+
     def schemas(self) -> list[dict[str, Any]]:
         return [tool.schema() for tool in self.tools]
 
@@ -278,6 +414,17 @@ class ToolRegistry:
         tool = self._tools.get(tool_call.name)
         if tool is None:
             raise ValueError(f"Unknown tool: {tool_call.name}")
+            
+        if runtime and runtime.status_callback:
+            if tool.name in ("read_skill", "metadata_search"):
+                runtime.status_callback(StatusEvent(LifecycleState.READING, f"Reading {tool_call.arguments}", runtime.loop_depth))
+            elif tool.name == "exec_shell":
+                runtime.status_callback(StatusEvent(LifecycleState.EXECUTING, f"Running {tool_call.arguments.get('command')}", runtime.loop_depth))
+            elif tool.name in ("write_file", "replace_content"):
+                runtime.status_callback(StatusEvent(LifecycleState.WRITING, f"Writing {tool_call.arguments.get('path')}", runtime.loop_depth))
+            else:
+                runtime.status_callback(StatusEvent(LifecycleState.EXECUTING, f"Running {tool.name}...", runtime.loop_depth))
+                
         return tool.handler(tool_call.arguments, runtime)
 
 
@@ -336,6 +483,63 @@ def build_default_registry() -> ToolRegistry:
                     "additionalProperties": False,
                 },
                 handler=_handle_metadata_search,
+            ),
+            ToolDefinition(
+                name="read_file",
+                description="Read contents of a file.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "start_line": {"type": "integer"},
+                        "end_line": {"type": "integer"}
+                    },
+                    "required": ["path"],
+                    "additionalProperties": False,
+                },
+                handler=_handle_read_file,
+            ),
+            ToolDefinition(
+                name="write_file",
+                description="Create or overwrite a file with content.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "content": {"type": "string"}
+                    },
+                    "required": ["path", "content"],
+                    "additionalProperties": False,
+                },
+                handler=_handle_write_file,
+            ),
+            ToolDefinition(
+                name="replace_content",
+                description="Replace exact string matches in a file.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "target": {"type": "string"},
+                        "replacement": {"type": "string"}
+                    },
+                    "required": ["path", "target", "replacement"],
+                    "additionalProperties": False,
+                },
+                handler=_handle_replace_content,
+            ),
+            ToolDefinition(
+                name="list_dir",
+                description="List all files in a directory.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"}
+                    },
+                    "required": ["path"],
+                    "additionalProperties": False,
+                },
+                handler=_handle_list_dir,
             ),
         ]
     )
@@ -438,6 +642,8 @@ def parse_tool_call(reply: str) -> tuple[Optional[ToolCall], Optional[str]]:
     Returns `(tool_call, error_message)`. When no tool call is present, both
     values are `None`.
     """
+    if not isinstance(reply, str):
+        return None, None
     candidates = _extract_json_candidates(reply)
     saw_toolish_json = False
     last_error: Optional[str] = None
@@ -529,15 +735,19 @@ def run_agent_loop(
     ui: Any,
     registry: Optional[ToolRegistry] = None,
     max_depth: int = DEFAULT_AGENT_MAX_DEPTH,
+    status_callback: Callable[[StatusEvent], None] | None = None,
 ) -> str:
     """Drive the structured tool-calling loop until a final answer is produced."""
     active_registry = registry or build_default_registry()
-    runtime = AgentRuntime(state=state, ui=ui)
+    runtime = AgentRuntime(state=state, ui=ui, status_callback=status_callback)
 
     depth = 0
-    reply = complete_fn(state.cfg, state.history, stream=False)
-
     while True:
+        if status_callback:
+            status_callback(StatusEvent(LifecycleState.THINKING, "Thinking...", depth))
+
+        reply = complete_fn(state.cfg, state.history, stream=False)
+
         state.add_assistant(reply)
         tool_call, parse_error = parse_tool_call(reply)
 

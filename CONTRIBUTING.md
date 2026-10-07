@@ -50,42 +50,9 @@ Small typo fixes, docs clarifications, and tightly scoped bug fixes can usually 
 
 ## Release/CD Setup
 
-For maintainers operating release pipelines, configure repository and account-level settings as follows:
+For maintainers operating the release pipeline:
 
-- GitHub Pages publishing source: **GitHub Actions**
-- Canonical release workflow: `.github/workflows/release-cd.yml` (tag-driven)
-- Compatibility workflows (`release-github.yml`, `release-pypi.yml`) are manual wrappers that delegate to the canonical workflow.
-- Required environments:
-  - `pypi` (for trusted publishing)
-  - `github-pages` (for docs deployment)
-- Required workflow permissions by workflow/job:
-  - `contents: write` for GitHub Release asset upload
-  - `id-token: write` for PyPI trusted publishing
-  - `pages: write` and `id-token: write` for docs deploy workflow
-- PyPI Trusted Publisher binding should match this repository and release workflow details:
-  - owner/repository
-  - workflow file path
-  - environment name `pypi`
-  - tag-based trigger (`vX.Y.Z.B`)
-
-GitHub Release publishing in Actions uses `GITHUB_TOKEN`; no Personal Access Token (PAT) is required for release uploads in the workflow context.
-
-## AI-Assisted Contributions
-
-AI tools may be used to help draft code, docs, tests, or analysis, but they do not replace contributor responsibility.
-
-- A human contributor must understand the full change before submission.
-- A human contributor must run or meaningfully review verification steps.
-- A human contributor must stand behind the final PR and address review comments.
-- Purely autonomous or end-to-end agent-submitted PRs are not acceptable for merge.
-- Disclose meaningful AI assistance in the PR template.
-
-See [AI_POLICY.md](./AI_POLICY.md) for the full repository policy.
-
-## Community Standards
-
-By participating in this project, you agree to follow the expectations in [CODE_OF_CONDUCT.md](./CODE_OF_CONDUCT.md).
-
-## Security
-
-Do not file public issues for security vulnerabilities. Follow [SECURITY.md](./SECURITY.md) instead.
+- `ci.yml` validates every PR/push (pytest, shellcheck, binary + `install.sh` smoke test).
+- `post_merge.yml` bumps the version and changelog on merges to `main`/`develop/**`; on `main` it also creates the `vX.Y.Z` tag and dispatches `release.yml`.
+- `release.yml` builds `macos-arm64`, `linux-x86_64`, `linux-arm64` bundles and publishes them, with `SHA256SUMS` and `install.sh`, to a GitHub Release.
+- Repository settings: Actions workflow permissions must be "Read and write", and branch protection on `main` must let `github-actions[bot]` push the version commit and tag.

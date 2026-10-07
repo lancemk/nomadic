@@ -1,438 +1,169 @@
 # NOMADIC
 
-**Agent First REPL for personal agentic prompting, local tool use, and session management.**
+**Agent-first REPL for local, Apple Silicon agentic work: tool use, multi-agent orchestration, human-in-the-loop safety review, and durable sessions.**
 
 ![alt text](banner.png)
 
-`nomadic` is an all-in-one CLI layer for running a local multimodal agent loop on Apple Silicon. It is built around an interactive REPL-style kernel where the agent is the primary interface, not an afterthought bolted onto a script runner.
+`nomadic` is a terminal kernel where the agent is the primary interface. It talks to a local MLX model server (`mlx_vlm` / `mlx_lm`), gives the model structured tools, records everything in SQLite or Postgres, and lets you run, review, fork, and rewind agent work.
 
-The project combines:
-
-- an interactive agent-first kernel
-- local multimodal prompting through `mlx_vlm.server` (and `mlx_lm.server` for text-only models)
-- structured tool-calling for file reading, shell execution, metadata search, and headless browsing
-- multi-agent orchestration with human-in-the-loop safety review
-- a persistent task registry for tracking objectives across a session
-- persistent session storage in SQLite or Postgres
-- lightweight prompt, context, and conversation management in one place
-
-This repo is still early, but the direction is clear: `nomadic` aims to become a practical personal working layer for local-first agent workflows.
-
-**Current platform scope:** `nomadic` currently supports **Apple Silicon only**. Other platforms are part of the roadmap, but they are not supported targets today.
-
-## What Nomadic Is
-
-`nomadic` treats the terminal like a personal agent workspace.
-
-Instead of juggling separate scripts, temporary prompts, shell snippets, and half-saved notes, you enter a persistent REPL where you can:
-
-- prompt the agent directly
-- load `SKILL.md` files into context
-- attach images to the next turn
-- run local commands and feed results back into the conversation
-- keep sessions resumable and queryable
-- manage context growth without losing the thread
-
-The result is a CLI that feels closer to a personal agent operating console than a plain chatbot wrapper.
-
-## Project Positioning
-
-`nomadic` is designed as an **Agent First** CLI:
-
-- the conversation is the main primitive
-- tools are native to the loop
-- prompts are stateful and resumable
-- sessions are durable
-- configuration is local and operator-friendly
-- the terminal remains fast, inspectable, and scriptable
-
-If you want a local, personal, transparent layer for agentic work, this is the kind of tool `nomadic` is trying to become.
-
-## Current Capabilities
-
-Today, the project already includes:
-
-- `serve`: run `mlx_vlm.server` locally
-- `kernel`: launch the interactive agent REPL
-- `extract`: summarize a `SKILL.md` into structured context
-- `initialize`: configure SQLite or Postgres session storage
-- `list-skills`: inventory `SKILL.md` files under a directory
-
-Inside `kernel`, you currently get:
-
-- `/skill <path>` to load a `SKILL.md`
-- `/image <path>` to attach an image to the next turn
-- `/exec <cmd>` to run a shell command and return output to context
-- `/history` to inspect prior turns
-- `/config` to inspect current runtime settings
-- `/session` to inspect persisted session metadata
-- `/model` to list known models and pick one by number, or `/model <name>` to switch to an arbitrary repo id (restart `serve` to apply)
-- `/temp <0.0-1.0>` to change temperature
-- `/tokens <n>` to change response budget
-- `/clear` to clear the active history
-- `/save <file>` to export the conversation as JSON
-- `/preset`, `/profile`, `/template` for reusable prompt and workspace configuration
-- `/chat list` / `/resume <id|name>` to inventory and switch between sessions
-
-Multi-agent orchestration and task management:
-
-- `/goal <objective>` to run an agent to completion against an objective, using the active safety profile
-- `/go` to let the agent continue acting on the current context without waiting on the next prompt
-- `/agents` to inspect and cancel parallel background agent instances
-- `/tasks [list|cancel <id>|inspect <id>]` / `/task` to inspect the persistent task registry
-- `/review` and `/safety` to inspect and change human-in-the-loop review policy
-- `/fork` to duplicate the active session into a new one
-- `/rewind` / `/undo` to roll back recent history
-- `/rename` to rename the active session
-
-Workspace, browsing, and developer ergonomics:
-
-- `/browser on|off` to launch a headless Chromium instance (via Playwright, optional dependency) and register browser tools
-- `/btw <question>` to run an isolated background side-question without disrupting the main conversation
-- `/add-dir <path>` to expand the agent's allowed workspace boundary at runtime
-- `/diff` to render a unified git diff of the active workspace
-- `/artifacts` to inspect files agents have generated
-- `/context` to see a token-budget breakdown of the active session
-- `/usage` and `/export` for session stats and serialization
-
-The default structured tool registry currently includes:
-
-- `read_skill`
-- `exec_shell`
-- `metadata_search`
-- `browser_navigate`, `browser_screenshot`, `browser_extract_text` (registered once `/browser on` is run)
-
-## Why This Exists
-
-The gap `nomadic` is trying to close is simple:
-
-Most local LLM tooling still makes you do too much glue work yourself.
-
-You end up with:
-
-- one script for inference
-- another for retrieval
-- raw shell commands for context gathering
-- ad hoc prompt files
-- no durable session model
-- no honest agent loop in the terminal
-
-`nomadic` tries to collapse that into one coherent surface.
-
-## Requirements
-
-Current practical target environment:
-
-- macOS on Apple Silicon
-- Python 3.14+
-- `mlx-vlm` and `mlx-lm` (text-only models are routed to `mlx_lm.server` automatically)
-- `requests`
-- local model artifacts compatible with the selected MLX server flow
-- `playwright` (optional, only needed for `/browser`)
-
-The project metadata is still evolving, so for now the safest install path is to install runtime dependencies explicitly.
-
-## Platform Support
-
-Current supported platform:
-
-- macOS on Apple Silicon
-
-Current non-goals for the present release line:
-
-- Windows support
-- Intel macOS support
-- Linux support
-
-Those platforms may be supported later, but the current project should be evaluated and used as an Apple Silicon-first tool.
+**Status:** early public OSS / active prototype. **Runtime support:** Apple Silicon (inference). The CLI itself ships for macOS arm64 and Linux x86_64/arm64 (e.g. to point at a remote OpenAI-compatible server); local MLX inference is macOS arm64 only.
 
 ## Install
 
-Basic local setup:
+One line, no Python needed (downloads a checksummed binary from the latest GitHub Release):
 
 ```bash
-pip install -e .
-pip install mlx-vlm requests
+curl -fsSL https://raw.githubusercontent.com/lancemk/nomadic/main/install.sh | bash
 ```
 
-If you want richer terminal UX:
+On Apple Silicon, add `--with-mlx` to also create a managed MLX runtime so `nomadic serve` works:
 
 ```bash
-pip install rich prompt-toolkit
+curl -fsSL https://raw.githubusercontent.com/lancemk/nomadic/main/install.sh | bash -s -- --with-mlx
 ```
 
-## Quick Start
+Options: `--version v0.2.0`, `--prefix DIR` (default `~/.local/bin`), `--uninstall`, `--dry-run`. Each release also attaches `SHA256SUMS` and the per-platform `nomadic-<version>-<platform>.tar.gz` bundles if you prefer to install by hand.
 
-Start the local server in one terminal:
+From source (development):
 
 ```bash
-python -m nomadic serve
-# or 
-uv run nomadic serve
+pip install -e ".[dev]"        # core + test/build tooling
+pip install -e ".[mlx]"        # local inference runtime (Apple Silicon)
+pip install -e ".[browser]"    # optional /browser tool (Playwright)
 ```
 
-Initialize persistent storage once:
+## Quick start
 
 ```bash
-python -m nomadic initialize --db-kind sqlite3 --db-path kernel.sqlite3
+nomadic serve                                   # terminal 1: local model server
+nomadic initialize --db-kind sqlite3 --db-path kernel.sqlite3   # once
+nomadic kernel                                  # terminal 2: the agent REPL
+nomadic kernel --session-id <uuid>              # resume a session
+nomadic --version
 ```
 
-Then launch the agent REPL:
+`python -m nomadic …` and `uv run nomadic …` are equivalent when installed from source.
 
-```bash
-python -m nomadic kernel
-# or
-uv run nomadic kernel
-```
+| Command | Purpose |
+|---|---|
+| `serve` | Run `mlx_vlm.server` (or `mlx_lm.server` for text-only models, chosen automatically) |
+| `kernel` | Interactive agent REPL |
+| `extract <SKILL.md>` | One-shot structured summary of a `SKILL.md` (optionally with `--image`) |
+| `initialize` | Write `~/.config/nomadic/config.jsonc` and validate SQLite/Postgres |
+| `list-skills` | Inventory `SKILL.md` files under a root |
 
-Typical one-off overrides:
+## What you get
 
-```bash
-python -m nomadic kernel --model mlx-community/Pixtral-12B-2409-4bit
-python -m nomadic kernel --db-kind postgres --postgres-dsn postgresql://user:pass@host/db
-python -m nomadic kernel --max-context-tokens 12000 --context-recompress-to 8000
-```
+**Agent layer**
+- `/goal`, `/go`, `/agents`: run parallel background agents against an objective, inspect and cancel them.
+- `/review`, `/safety`: human-in-the-loop approval of risky tool calls via configurable safety profiles and per-tool policies.
+- `/tasks`, `/task`: persistent, DB-backed task registry (status, assigned agent, artifacts).
 
-Resume an existing session:
+**Sessions**
+- SQLite or Postgres persistence, resume by id or name, `/save`, `/chat list`, `/fork`, `/rewind`, `/undo`, `/export`, `/usage`, `/context`.
+- Automatic context compression with model-written memory summaries.
 
-```bash
-python -m nomadic kernel --session-id <uuidv4>
-```
+**Tools and workspace**
+- Registry: `read_skill`, `exec_shell`, `metadata_search`, user tool packs in `~/.config/nomadic/tools`, and `browser_*` after `/browser on`.
+- `/skill`, `/image`, `/exec`, `/add-dir`, `/diff`, `/artifacts`, `/btw`, `/preset`, `/profile`, `/template`, `/model` (picker), `/temp`, `/tokens`.
 
-The legacy root scripts `nomadic.py` and `db.py` are still kept as compatibility wrappers, but the package-first entrypoints above are now the preferred interface.
+**Local runtime**
+- Unified-memory audit and on-the-fly quantization (8/4/3/2-bit) so mid-sized models fit on constrained Macs.
+- `key=value` inline CLI parameters, Hugging Face `hf://` / `models/` identifiers.
 
-## Command Surface
+Full command details live in [GUIDE.md](GUIDE.md); history in [CHANGELOG.md](CHANGELOG.md).
 
-### `serve`
+## Why Nomadic
 
-Runs the bundled `mlx_vlm.server` flow with inline config.
+- **Local-first by construction.** The default path is an MLX model on your own Mac: no API key, no data leaving the machine.
+- **Built-in oversight.** HITL review, safety profiles, and a task registry are part of the kernel, not add-ons. You see and gate what agents do.
+- **Orchestration in the box.** Spawn, track, and cancel several background agents from one session.
+- **Durable, queryable state.** Sessions, messages, events, and tasks live in a real database (SQLite or Postgres), so work is resumable, forkable, and inspectable with SQL.
+- **Apple Silicon awareness.** Memory auditing and automatic quantization decide what can actually run on your hardware.
+- **Monitoring-minded.** Usage, context budget, task and agent status are first-class commands.
 
-```bash
-python -m nomadic serve
-```
+## What Nomadic is not
 
-### `kernel`
+- **Not a frontier-model client.** It targets local MLX servers; hosted providers (Anthropic, OpenAI, Google, …) are not a first-class path today.
+- **Not cross-platform for inference.** Local serving is macOS arm64 only. Windows and Intel macOS are unsupported.
+- **Not a minimal, hackable harness.** It is opinionated and monolithic (one large Python CLI). There is no extension API beyond tool packs and prompt presets.
+- **Not battle-tested.** The orchestrator, HITL, and task layers are young; test coverage is thinner than for the core loop.
+- **Not a plugin ecosystem.** No package registry, no MCP client, no themes or shareable extensions.
+- **Not a model-quality fix.** Small local models are weaker at tool use than hosted ones; Nomadic structures the loop but cannot make a 4-bit local model reason like a frontier model.
 
-Launches the interactive Agent First REPL.
+## Why pi.dev is preferred (for most people)
 
-```bash
-python -m nomadic kernel
-```
+[pi](https://pi.dev) is a minimal, extensible agent harness. Honest comparison, based on its public site:
 
-### `extract`
+| Dimension | Nomadic | pi.dev |
+|---|---|---|
+| Philosophy | Batteries-included kernel | Minimal harness; adapt it via primitives |
+| Model access | Local MLX servers | 15+ providers (Anthropic, OpenAI, Google, Bedrock, Ollama, custom, …) |
+| Platforms | macOS arm64 inference; CLI binaries for Linux | Cross-platform TypeScript tooling |
+| Extensibility | Tool packs, presets, templates | TypeScript extensions, skills, prompt templates, themes, npm/git packages |
+| Sessions | DB-backed (SQLite/Postgres), fork, rewind | Tree-structured history, `/tree` branching, HTML/gist export |
+| Modes | Interactive REPL, one-shot extract | Interactive TUI, print/JSON, RPC, SDK embedding |
+| Sub-agents / permissions | Built in (orchestrator, HITL review) | Deliberately omitted; build via extensions |
+| Maturity and community | Early prototype, single maintainer | Established, broader ecosystem |
 
-One-shot extraction for a `SKILL.md` file.
+**Prefer pi.dev when** you want hosted or mixed models, cross-platform use, a large extension ecosystem, SDK/RPC embedding, or a mature, minimal core you can reshape.
 
-```bash
-python -m nomadic extract /path/to/SKILL.md
-python -m nomadic extract /path/to/SKILL.md --image /path/to/diagram.png
-```
+**Choose Nomadic when** you want a fully local Apple Silicon workflow with orchestration, approval gates, and database-backed task and session state out of the box, and you accept a younger, more opinionated tool.
 
-### `initialize`
+## CI/CD and releases
 
-Writes `~/.config/nomadic/config.jsonc` and validates the selected database.
+| Workflow | Trigger | Does |
+|---|---|---|
+| `CI` | PRs to `main` / `develop/**`, pushes | pytest on Ubuntu + macOS, package build, shellcheck, binary build + `install.sh` smoke test |
+| `Post-Merge Version and Changelog` | PR merged to `main` / `develop/**` | Conventional-commit semver bump, changelog entry; on `main` also tags `vX.Y.Z` and dispatches the release |
+| `Release` | `v*` tag or manual dispatch | Tests, builds PyInstaller bundles for `macos-arm64`, `linux-x86_64`, `linux-arm64`, publishes them with `SHA256SUMS` and `install.sh` to a GitHub Release |
 
-```bash
-python -m nomadic initialize --db-kind sqlite3 --db-path kernel.sqlite3
-python -m nomadic initialize --db-kind postgres --postgres-dsn postgresql://user:pass@host/db
-```
+Maintainer notes: the post-merge job pushes a version commit and tag to `main`, so branch protection must allow `github-actions[bot]` to push. Release bundles are named `nomadic-<version>-<platform>.tar.gz`. To build locally: `NOMADIC_REQUIRE_BINARIES=1 bash scripts/build_bundle.sh` (needs `pip install -e ".[dev]"`).
 
-### `list-skills`
+## Client-side file layout
 
-Scans a root directory for `SKILL.md` files.
+A deployed `nomadic` (binary or pip install) writes to a fixed set of per-user locations, following the XDG convention. Run `nomadic paths` to see the resolved values on any machine.
 
-```bash
-python -m nomadic list-skills --root /mnt/skills
-```
+| Kind | Default | Contents |
+|---|---|---|
+| **config** | `~/.config/nomadic/` | `config.jsonc` (DB target, profiles, presets, templates), `tools/` (user tool packs) |
+| **data** | `~/.local/share/nomadic/` | `nomadic.sqlite3` (sessions, messages, events, tasks), `venv/` (MLX runtime from `install.sh --with-mlx`), `screenshots/` (browser tool) |
+| **cache** | `~/.cache/nomadic/` | `quantized/<model>/<bits>bit/` runtime-quantized models (regenerable, can be tens of GB) |
+| **state** | `~/.local/state/nomadic/` | `history.txt` (REPL input history, bounded by `NOMADIC_HISTORY_SIZE`, default 1000) |
+| **binaries** | `~/.local/bin/` | `nomadic`, `nomadic-db` (override with `install.sh --prefix`) |
 
-## Session Storage
+Not managed by nomadic: downloaded model weights live in the Hugging Face cache (`$HF_HOME`, default `~/.cache/huggingface`). Workspace outputs you request explicitly (`/save`, `/export`, `extract` writing `./evals/`, agent `write_file`) go where you point them or the current directory.
 
-`nomadic` supports both:
+Relocate everything with one variable: `NOMADIC_HOME=/srv/nomadic` gives `config/ data/ cache/ state/` beneath it. Otherwise each kind honors its `XDG_*_HOME` variable. Other overrides: `NOMADIC_PYTHON` (interpreter hosting MLX), `NOMADIC_HISTORY_SIZE`, `--db-path` / `--postgres-dsn` / `--config`.
 
-- SQLite for simple local-first session persistence
-- Postgres for more durable or shared session backends
+Upgrade notes: the default SQLite file moved from `./kernel.sqlite3` (working directory) to `~/.local/share/nomadic/nomadic.sqlite3`. A `kernel.sqlite3` already in the working directory, or a path stored in `config.jsonc`, keeps being used. Quantized models already under `~/.config/nomadic/quantized/` are reused, and history is copied from `~/.config/nomadic/history.txt` on first run.
 
-For local Postgres middleware, the repo now includes a dedicated Compose service and init SQL under `containers/postgres/`:
+Uninstall: `install.sh --uninstall` removes the binaries and the MLX venv, and leaves config, databases, and caches in place. Delete the directories above to remove everything.
 
-```bash
-docker compose up -d postgres
-python -m nomadic initialize --db-kind postgres --postgres-dsn postgresql://nomadic:nomadic@127.0.0.1:5432/nomadic
-```
+## Session storage
 
-The config-backed default lives at:
-
-```text
-~/.config/nomadic/config.jsonc
-```
-
-You can still override the backend per run with CLI flags.
-
-## CI/CD and Releases
-
-The repository now includes a GitHub Actions release layer built around four workflows:
-
-- `CI`: validate imports, unit tests, and package buildability for PRs into `main` and `develop/*`
-- `Build Bundles`: create macOS and Linux release archives as GitHub Actions artifacts for tags
-- `Post-Merge Version and Changelog`: bump semantic version and append changelog entry after merged PRs into `main` and `develop/*`
-- `Publish Release`: attach built archives to a GitHub Release when a version tag is pushed
-
-Branch behavior:
-
-- PRs targeting `main` and `develop/*` run validation without mutating tracked files
-- only merged PRs into `main` and `develop/*` can mutate `pyproject.toml` and `CHANGELOG.md`
-- tags matching `v*` trigger release publication
-
-Release bundle behavior:
-
-- artifacts are produced for `macos-arm64` and `linux-x86_64`
-- the bundle name format is `nomadic-<version>-<platform>.tar.gz`
-- each bundle includes the installable package artifacts, docs, license file, changelog, and SQL assets
-
-Linux artifacts are currently provided as CI/release deliverables for packaging and roadmap preparation. They do not change the current product support boundary: Apple Silicon remains the only supported runtime target today.
-
-## Context Management
-
-The REPL includes automatic context compression.
-
-That means:
-
-- the system prompt is preserved
-- recent turns stay verbatim as long as possible
-- older turns are compressed into a memory summary when the budget is exceeded
-
-This is intentionally approximate and tokenizer-light, which keeps the loop practical for a local terminal workflow.
+SQLite for local-first use; Postgres for shared or durable setups (`docker compose up -d postgres`, then `nomadic initialize --db-kind postgres --postgres-dsn postgresql://nomadic:nomadic@127.0.0.1:5432/nomadic`). The schema ships inside the package (`nomadic/sql/*.sql`) and in the binary, so `nomadic-db init` needs no external files. Any setting can be overridden per run with flags.
 
 ## Roadmap
 
-The scope of `nomadic` is broader than the current implementation. Below is the working milestone map, with a clear split between what exists now and what comes next.
+Completed milestones (0-8 baselines and the agent layer) are tracked in [CHANGELOG.md](CHANGELOG.md). Open work:
 
-### Milestone 0: Foundation
-
-*(Completed features are tracked in [CHANGELOG.md](CHANGELOG.md))*
-
-### Milestone 1: Agent REPL Baseline
-
-*(Completed features are tracked in [CHANGELOG.md](CHANGELOG.md))*
-
-### Milestone 2: Session Persistence
-
-*(Completed features are tracked in [CHANGELOG.md](CHANGELOG.md))*
-
-### Milestone 3: Local Tooling Layer
-
-*(Completed features are tracked in [CHANGELOG.md](CHANGELOG.md))*
-
-### Milestone 4: Prompting and Context Ops
-
-*(Completed features are tracked in [CHANGELOG.md](CHANGELOG.md))*
-
-### Milestone 5: Personal Agent Workspace
-
-*(Completed features are tracked in [CHANGELOG.md](CHANGELOG.md))*
-- [ ] file-centric workflows beyond `SKILL.md`
-- [ ] tighter personal knowledge ingestion
-
-### Milestone 6: Multimodal and Retrieval Expansion
-
-*(Completed features are tracked in [CHANGELOG.md](CHANGELOG.md))*
-- [ ] richer vision workflows
-- [ ] retrieval adapters beyond the current metadata service
-- [ ] local vector / index integrations
-- [ ] source-aware answer synthesis
-
-### Milestone 7: OSS Hardening
-
-*(Completed features are tracked in [CHANGELOG.md](CHANGELOG.md))*
-- [ ] package metadata polish
-- [ ] public docs expansion
-- [ ] contributor workflow and issue templates
-- [ ] API stability and semantic versioning discipline
-
-### Milestone 8: Platform Expansion
-
-*(Completed features are tracked in [CHANGELOG.md](CHANGELOG.md))*
-- [ ] Linux support investigation
-- [ ] Intel macOS feasibility review
-- [ ] Windows support investigation
-- [ ] platform-specific runtime and packaging strategy
-- [ ] cross-platform test matrix
-
-### Milestone 9: Agent Platform Direction
-
-*(Completed features are tracked in [CHANGELOG.md](CHANGELOG.md))*
-- [ ] pluggable tool registries
-- [ ] remote execution adapters
-- [ ] richer session analytics and evaluation
-- [ ] portable agent workspace format
-
-## What Is Actually Done Today
-
-The project is still early-stage.
-
-The completed work is mostly in:
-
-- the terminal kernel loop
-- the structured local tool-calling foundation, including an optional headless browser tool
-- `SKILL.md` ingestion
-- session persistence, forking, and rewind
-- database initialization and backend selection
-- context compression
-- multi-agent orchestration with a human-in-the-loop safety review layer
-- a persistent, DB-backed task registry
-- release automation, including standalone PyInstaller binaries
-- basic tests around kernel input, metadata search, DB behavior, and the orchestration/HITL/task surface
-
-That is a meaningful base. The orchestration and HITL layer in particular puts `nomadic` closer to a genuine local multi-agent platform than the earlier single-agent REPL prototype, but it is still young: those subsystems are largely undocumented outside `specs/`, unstaged/uncommitted for stretches at a time, and not yet exercised by the same depth of test coverage as the core kernel loop.
-
-## Near-Term Next Features
-
-The most natural next steps from the current state are:
-
-1. Package polish and public OSS hygiene.
-2. Contribution, security, and release docs.
-3. Test coverage for the orchestrator, HITL manager, and task registry proportional to the core kernel loop's.
-4. Better retrieval and memory integrations.
-5. Pluggable tool registries and remote execution adapters (Milestone 9 remainder).
+- [ ] Tests for orchestrator, HITL, and task registry on par with the kernel loop
+- [ ] Hosted/OpenAI-compatible remote provider as a first-class backend
+- [ ] Pluggable tool registries and remote execution adapters
+- [ ] Retrieval and memory integrations (vector/index, source-aware answers)
+- [ ] File-centric workflows beyond `SKILL.md`
+- [ ] Signed/notarized macOS binaries; Intel macOS and Windows feasibility
+- [ ] Public docs, issue templates, API stability policy
 
 ## Philosophy
 
-`nomadic` is opinionated in a few ways:
-
-- local-first is a feature, not a fallback
-- terminal workflows should still feel premium
-- agent loops should be inspectable
-- persistence matters
-- prompting is work, and work deserves structure
+Local-first is a feature. Agent loops should be inspectable. Persistence matters. Prompting is work, and work deserves structure.
 
 ## Appreciation
 
-This project stands on the shoulders of excellent open-source work.
-
-Special appreciation goes to the teams and contributors behind:
-
-- **MLX**
-- **MLX_VM**
-- **MLX_VLM**
-
-Their work has materially expanded what local-first AI workflows can look like on Apple Silicon. Projects like `nomadic` are only practical because that ecosystem keeps pushing inference, model serving, and developer ergonomics closer to everyday use. The open-source contribution here is not just technical plumbing, it is enabling a whole category of personal agent software to exist in a lightweight, local, and inspectable form.
-
-## Project Status
-
-Current status: **early public OSS / active prototype**.
-
-Current support boundary: **Apple Silicon only**.
-
-Expect:
-
-- working flows
-- uneven edges
-- active iteration
-- changing interfaces
-
-## Documentation
-
-For deeper command and usage details, see [GUIDE.md](GUIDE.md).
+Built on the shoulders of **MLX**, **mlx-lm**, and **mlx-vlm**, whose work makes local-first agent software practical on Apple Silicon. Thanks also to the pi project for demonstrating how far a minimal harness can go.
 
 ## License
 
-This project should ship under Apache 2.0 for public OSS release, with the full license text in `LICENSE`.
+Apache 2.0, see [LICENSE.md](LICENSE.md).

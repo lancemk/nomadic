@@ -4,19 +4,39 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nomadic"
-version = "0.1.0"
-description = "An open-anything inspried Multi-purpose Working Layer—specifci of Agentic Orchetration and Metrics Monitoring all in one place"
+version = "0.2.0"
+description = "Agent-first local REPL: multi-agent orchestration, HITL safety review, persistent sessions and task registry on Apple Silicon."
 readme = "README.md"
 requires-python = ">=3.14"
+license = { file = "LICENSE.md" }
+keywords = ["agent", "repl", "mlx", "apple-silicon", "local-llm", "cli"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Operating System :: MacOS",
+]
 dependencies = [
-    "build>=1.5.1",
-    "mlx-lm>=0.31.1",
-    "mlx-vlm>=0.4.4",
     "prompt-toolkit>=3.0.52",
-    "psycopg>=3.2.0",
+    "psycopg[binary]>=3.2.0",
     "requests>=2.32.0",
     "rich>=14.3.3",
 ]
+
+[project.optional-dependencies]
+# Local inference runtime — Apple Silicon only (installed by `install.sh --with-mlx`).
+mlx = [
+    "mlx-lm>=0.31.1; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "mlx-vlm>=0.4.4; sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
+browser = ["playwright>=1.48"]
+dev = ["build>=1.5.1", "pytest>=8", "pyinstaller>=6.10"]
+
+[project.urls]
+Homepage = "https://github.com/lancemk/nomadic"
+Issues = "https://github.com/lancemk/nomadic/issues"
+Changelog = "https://github.com/lancemk/nomadic/blob/main/CHANGELOG.md"
 
 [project.scripts]
 nomadic = "nomadic.cli:main"

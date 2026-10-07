@@ -254,3 +254,5 @@ __marimo__/
 # local-first agent
 specs/
 .sovai
+# Stamped by scripts/build_bundle.sh for standalone binaries.
+nomadic/_version.py

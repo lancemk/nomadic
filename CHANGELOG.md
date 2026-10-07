@@ -12,82 +12,40 @@ reruns remain idempotent.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-07
+
+Project re-vitalization (minor bump; pre-1.0, so the default database location change ships here with upgrade notes in the README): feature log compacted by capability area, release pipeline reconciled end to end.
+
 ### Added
-- **Multi-Agent Orchestration**: New `Orchestrator`/`AgentInstance` model (`nomadic/orchestrator.py`) for spawning, tracking, and cancelling parallel background agents from within a session, surfaced via `/goal`, `/go`, `/agents`, and `/tasks`.
-- **Human-in-the-Loop Safety Review**: New `HITLManager` (`nomadic/hitl.py`) with configurable `SafetyProfile`s and per-tool `ReviewPolicy` matching, so risky tool calls can require explicit approval before executing. Exposed via `/review` and `/safety`.
-- **Persistent Task Registry**: New DB-backed `TaskRegistry`/`Task` model (`nomadic/tasks.py`, `nomadic/sql/tasks.sql`) tracking objective status, assigned agent, and generated artifacts across a session, inspectable via `/tasks` and `/task`.
-- **Session Time-Travel**: `/fork` duplicates the active session under a new ID; `/rewind` / `/undo` revert recent history from the database.
-- **Headless Browser Tool**: `/browser on` launches a headless Playwright Chromium instance and registers `browser_navigate`, `browser_screenshot`, and `browser_extract_text` as agent tools (requires the optional `playwright` package).
-- **Workspace & Developer Ergonomics**: `/add-dir` expands the agent's allowed workspace boundary at runtime; `/diff` renders a unified git diff of the active workspace; `/artifacts` inspects files agents have generated; `/context` shows a token-budget breakdown; `/usage` and `/export` surface session stats and serialize sessions out.
-- **Standalone CLI Binaries**: `scripts/build_bundle.sh` now compiles `nomadic` and `nomadic-db` into onefile PyInstaller executables (new `nomadic_bin.py` entrypoint) when PyInstaller is available, with `install.sh` installing the binaries directly instead of requiring a Python environment. `Build Bundles` CI now also targets `linux-arm64`.
-- **Dynamic Runtime Quantization & Resource Auditor**: Integrated macOS unified memory auditing (`sysctl hw.memsize`) and model parameter estimation (from configuration metadata or repository name pattern matching) to dynamically calculate inference RAM limits. Auto-decides the optimal bit-width (8, 4, 3, 2-bit) and invokes `mlx_lm convert`/`mlx_vlm.convert` on the fly to quantize dense mid-sized models (e.g., 36B) on constrained edge devices like 48GB unified memory MacBooks.
-- **Inline Key-Value CLI Parameters**: Added support for passing parameters in `key=value` format directly to the nomadic commands at invocation (e.g. `model=mlx-community/Qwen2.5-32B-Instruct`), bypassing standard argparse restrictions while performing strict attribute validation.
-- **Hugging Face CLI Compatible Model Identifiers**: Enabled support for model identifiers containing `hf://` or `models/` prefixes (matching `huggingface-cli` or `hf` formats), automatically normalizing them to standard repo IDs for local caching and server/inference routines.
-- **Interactive Slash Command Autocomplete**: Implemented dynamic, real-time dropdown menu in the REPL for slash commands using `prompt_toolkit`'s `WordCompleter` and float containers.
-- **Persistent Input History**: Added `BoundedFileHistory` allowing users to navigate previous inputs across sessions using the up-arrow key. Automatically truncates to 1000 items (configurable via `NOMADIC_HISTORY_SIZE`), saving to `~/.config/nomadic/history.txt`.
-- **Status Feedback Layer**: Introduced intermediate state indicators (e.g., *Thinking...*, *Reading codebase...*, *Running tests...*). Emits granular `StatusEvent`s from `AgentRuntime` that render as transient UI spinners via `rich.status` without polluting the persistent chat log.
-- **`/model` Selection Menu**: `/model` with no arguments (or `/model select`) now lists known model candidates with their caveats and the currently active one, and accepts a list number as a shorthand for `/model <repo-id>`.
+- **Standalone distribution**: tag-driven GitHub Release publishes `nomadic` and `nomadic-db` PyInstaller binaries for `macos-arm64`, `linux-x86_64`, `linux-arm64`, plus `SHA256SUMS` and `install.sh`.
+- **`install.sh`**: one-line installer (`curl … | bash`) that resolves the release, verifies the SHA-256, installs to `~/.local/bin`, and optionally (`--with-mlx`) builds a managed MLX runtime venv. Supports `--version`, `--prefix`, `--uninstall`, `--dry-run`, and local-bundle mode.
+- **Client-side file layout** (`nomadic/paths.py`, `nomadic paths`): XDG-style config/data/cache/state dirs with a single `NOMADIC_HOME` override; documented in the README.
+- **`nomadic --version`**; binaries are version-stamped at build time.
+- **CI**: pytest matrix (Ubuntu + macOS), shellcheck, and a binary-smoke job that builds the bundle and installs it via `install.sh`.
+- **`pyproject.toml` extras**: `mlx` (Apple Silicon only), `browser`, `dev`; MLX is no longer a hard dependency, so CI and Linux installs work.
+
+### Changed
+- **Agent layer (compacted)**: multi-agent `Orchestrator` (`/goal`, `/go`, `/agents`), human-in-the-loop `HITLManager` with safety profiles (`/review`, `/safety`), and a persistent DB-backed `TaskRegistry` (`/tasks`, `/task`).
+- **Sessions (compacted)**: `/fork`, `/rewind`/`/undo`, `/rename`, `/export`, `/usage`, `/context`; persistent bounded input history.
+- **Workspace & tools (compacted)**: headless Playwright browser tools (`/browser`), `/add-dir`, `/diff`, `/artifacts`, `/btw`; `/model` selection menu and Hugging Face-style `hf://` / `models/` identifiers.
+- **Runtime (compacted)**: automatic `mlx_lm` vs `mlx_vlm` server selection for text-only models, unified-memory audit with automatic runtime quantization, inline `key=value` CLI parameters, slash-command autocomplete, and `StatusEvent` progress spinners.
+- **Release flow**: merged PRs to `main` now bump the version, append the changelog, create the `v*` tag and dispatch the release build in one chain (previously no tag was ever created, so nothing published). `build.yml` + `release.yml` merged into a single `release.yml`.
 
 ### Fixed
-- **Crash on Null Model Response**: `/model` only updates client-side config — the running `serve` process keeps whatever model it was started with until restarted. Sending a request against a mismatched model (or one that returns `tool_calls` instead of text content) previously crashed the kernel with `VLM error: 'NoneType' object has no attribute 'strip'` deep inside tool-call parsing. `vlm_complete` now detects a null/missing `content` field and raises a clear, actionable error instead, and `agent.parse_tool_call` no longer crashes if it's ever handed a non-string reply.
-- **Dynamic MLX Server Selection**: Resolved startup crash when attempting to serve text-only language models that have vestigial vision configs (like `Qwen-AgentWorld-35B-A3B-bf16`). The launcher now automatically detects whether a model is text-only (using its config's `language_model_only` attribute or lack of vision configs) and runs `mlx_lm` instead of `mlx_vlm`.
+- Default SQLite database was `./kernel.sqlite3` relative to the working directory, scattering databases wherever the binary ran; it is now `~/.local/share/nomadic/nomadic.sqlite3` (existing `./kernel.sqlite3` and configured paths still honored).
+- Multi-GB quantized models were cached under `~/.config/`, and browser screenshots in the config dir; they now live in the cache and data dirs (legacy copies reused).
+- Release matrix used the non-existent `ubuntu-24.04-arm64` runner label (now `ubuntu-24.04-arm`).
+- Post-merge workflow interpolated the PR title directly into a shell command (script injection); now passed via environment.
+- `mlx_lm convert` / `mlx_vlm convert` was passed as a single argv token and could never run.
+- Frozen binaries re-invoked themselves for `serve`; the MLX runtime is now resolved from the managed venv or `$NOMADIC_PYTHON`, with an actionable error when absent.
+- Crash on null model response (`'NoneType' object has no attribute 'strip'`) replaced by a clear error; `parse_tool_call` tolerates non-string input.
 
-## [0.1.0.0] - 2026-05-16
+## [0.1.0] - 2026-05-16
 
-### Implemented Features (Transferred from README Roadmap)
+Foundation release (milestones 0-8 baseline):
 
-#### Milestone 0: Foundation
-- Core Python CLI structure
-- Local `mlx_vlm.server` launcher
-- Interactive kernel command
-- One-shot `SKILL.md` extraction flow
-- Basic local tool-calling loop
-
-#### Milestone 1: Agent REPL Baseline
-- REPL-style terminal interaction
-- Built-in slash commands
-- Multiline input support when `prompt_toolkit` is installed
-- Interrupt handling with safe kernel return
-- Suggested next-step menu after responses
-
-#### Milestone 2: Session Persistence
-- Persistent chat session model
-- Session/message/event schema
-- Resume by session UUID
-- Auto-title from first meaningful user turn
-- SQLite backend
-- Postgres backend
-- Config-driven database initialization
-- **Advanced Session Management**:
-    - DB-backed `/save <name>` to name/rename sessions in database
-    - `/chat list` to inventory sessions associated with the current working directory
-    - `/chat resume <id|name>` and `/resume <id|name>` for in-kernel session switching
-    - PWD tracking in session metadata for project-aware session filtering
-
-#### Milestone 3: Local Tooling Layer
-- `read_skill`
-- `exec_shell`
-- `metadata_search`
-- richer tool registry management (dynamic registration/unregistration)
-- user-defined local tool packs (load tools from `~/.config/nomadic/tools`)
-
-#### Milestone 4: Prompting and Context Ops
-- history compression
-- runtime prompt controls for temperature and token budget
-- reusable prompt presets via `/preset` command
-- named workspaces and profiles via `/profile` command and `--profile` flag
-- prompt templates for common agent tasks via `/template` command
-- better session summarization and memory shaping (VLM-driven semantic memory generation during history compression)
-
-#### Milestone 5: Personal Agent Workspace
-- project-aware working directories (via PWD metadata tracking and `/chat list`)
-
-#### Milestone 6: Multimodal and Retrieval Expansion
-- image attachment to user turns
-
-#### Milestone 7: OSS Hardening
-- basic test coverage
-- release automation
-
-#### Milestone 8: Platform Expansion
-- Apple Silicon baseline
+- **Kernel**: interactive agent REPL, slash commands, multiline input, safe interrupt handling, next-step menu, local `mlx_vlm.server` launcher, one-shot `SKILL.md` extraction.
+- **Persistence**: SQLite and Postgres backends, config-driven init, resume by UUID, auto-titling, `/save`, `/chat list`, `/resume`, PWD-aware session filtering.
+- **Tools**: `read_skill`, `exec_shell`, `metadata_search`, dynamic tool registry, user tool packs in `~/.config/nomadic/tools`.
+- **Context ops**: history compression with VLM-generated memory, `/temp` and `/tokens`, `/preset`, `/profile`, `/template`, image attachment.
+- **Hardening**: unit tests, release automation, Apple Silicon baseline.

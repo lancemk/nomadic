@@ -18,11 +18,13 @@ from importlib.resources import files
 from typing import Any, Iterator, Mapping, Optional
 from urllib.parse import urlsplit, urlunsplit
 
+from . import paths
+
 PACKAGE_ROOT = files("nomadic")
 SQLITE_SCHEMA_RESOURCE = PACKAGE_ROOT.joinpath("sql", "sqlite_schema.sql")
 POSTGRES_SCHEMA_RESOURCE = PACKAGE_ROOT.joinpath("sql", "postgres_schema.sql")
 TASKS_SCHEMA_RESOURCE = PACKAGE_ROOT.joinpath("sql", "tasks.sql")
-DEFAULT_DB_PATH = pathlib.Path("kernel.sqlite3")
+DEFAULT_DB_PATH = paths.default_db_path()
 
 SESSION_STATUSES = {"active", "paused", "closed", "archived"}
 MESSAGE_ROLES = {"system", "user", "assistant", "tool"}
@@ -69,8 +71,7 @@ def utc_now() -> str:
 
 
 def default_config_dir(home: str | pathlib.Path | None = None) -> pathlib.Path:
-    home_path = pathlib.Path(home).expanduser() if home is not None else pathlib.Path.home()
-    return home_path / ".config" / "nomadic"
+    return paths.config_dir(home)
 
 
 def default_config_path(home: str | pathlib.Path | None = None) -> pathlib.Path:

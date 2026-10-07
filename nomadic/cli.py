@@ -81,6 +81,7 @@ except ImportError:
     _REQUESTS = False
 
 from . import agent
+from . import paths
 from . import db as chatdb
 from .hitl import HITLManager, SafetyProfile, ReviewDecision
 from .tasks import TaskRegistry, TaskStatus
@@ -229,6 +230,48 @@ def determine_optimal_q_bits(model_path: str) -> int:
         return 2
 
 
+def get_version() -> str:
+    """Resolve the version: stamped file (binaries) → source pyproject → package metadata."""
+    try:
+        from ._version import __version__
+        return __version__
+    except ImportError:
+        pass
+    try:
+        import tomllib
+        root = pathlib.Path(__file__).resolve().parent.parent / "pyproject.toml"
+        return tomllib.loads(root.read_text(encoding="utf-8"))["project"]["version"]
+    except Exception:
+        pass
+    try:
+        from importlib.metadata import version
+        return version("nomadic")
+    except Exception:
+        return "0.0.0+unknown"
+
+
+def runtime_python() -> str:
+    """Interpreter that hosts the MLX runtime (mlx_lm / mlx_vlm).
+
+    From source this is the current interpreter. In a PyInstaller binary
+    ``sys.executable`` is the binary itself, so resolve the managed runtime
+    venv created by ``install.sh --with-mlx`` (or ``$NOMADIC_PYTHON``).
+    """
+    override = os.environ.get("NOMADIC_PYTHON")
+    if override:
+        return override
+    if not getattr(sys, "frozen", False):
+        return sys.executable
+    home = paths.data_dir()
+    for candidate in (home / "venv" / "bin" / "python", home / "venv" / "Scripts" / "python.exe"):
+        if candidate.exists():
+            return str(candidate)
+    raise RuntimeError(
+        "MLX runtime not found. Run `install.sh --with-mlx` (Apple Silicon) "
+        "or set NOMADIC_PYTHON to a Python with mlx-lm/mlx-vlm installed."
+    )
+
+
 def run_quantization(model_path: str, q_bits: int, cache_dir: pathlib.Path) -> str:
     """Execute mlx_lm convert / mlx_vlm.convert as a subprocess to quantize the model."""
     import shutil
@@ -238,10 +281,7 @@ def run_quantization(model_path: str, q_bits: int, cache_dir: pathlib.Path) -> s
     module_name = "mlx_lm" if is_text else "mlx_vlm"
 
     cmd = [
-        # Calling `python -m mlx_lm convert ...` directly is deprecated. Use `mlx_lm convert ...` or `python -m mlx_lm convert ...` instead.
-        # sys.executable, "-m", f"{module_name}.convert",
-        # 
-        sys.executable, "-m", f"{module_name} convert",
+        runtime_python(), "-m", module_name, "convert",
         "--hf-path", model_path,
         "-q",
         "--q-bits", str(q_bits),
@@ -399,14 +439,14 @@ class ServerConfig:
         """Arguments passed to the local server command."""
         if is_text_only_model(self.model):
             return [
-                sys.executable, "-m", "mlx_lm", "server",
+                runtime_python(), "-m", "mlx_lm", "server",
                 "--model",       self.model,
                 "--host",        self.host,
                 "--port",        str(self.port),
             ]
         else:
             return [
-                sys.executable, "-m", "mlx_vlm", "server",
+                runtime_python(), "-m", "mlx_vlm", "server",
                 "--model",       self.model,
                 "--host",        self.host,
                 "--port",        str(self.port),
@@ -769,7 +809,7 @@ class KernelInput:
         except ValueError:
             max_hist = 1000
         
-        history_path = chatdb.default_config_dir() / "history.txt"
+        history_path = paths.history_path()
         history_path.parent.mkdir(parents=True, exist_ok=True)
         history = BoundedFileHistory(str(history_path), max_length=max_hist)
 
@@ -1318,14 +1358,19 @@ def cmd_serve(cfg: ServerConfig):
     Blocks until Ctrl-C.
     """
     server_type = "mlx_lm" if is_text_only_model(cfg.model) else "mlx_vlm"
+    try:
+        argv = cfg.server_argv
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        sys.exit(2)
     ui.rule(f"{server_type}.server")
     ui.info(f"Model : {cfg.model}")
     ui.info(f"Bind  : {cfg.host}:{cfg.port}")
-    ui.info(f"Cmd   : {' '.join(cfg.server_argv)}")
+    ui.info(f"Cmd   : {' '.join(argv)}")
     ui.rule()
     print()
     try:
-        proc = subprocess.run(cfg.server_argv)
+        proc = subprocess.run(argv)
         sys.exit(proc.returncode)
     except KeyboardInterrupt:
         ui.info("Server stopped.")
@@ -1969,7 +2014,7 @@ def cmd_kernel(
             return agent.ToolExecutionResult("browser_screenshot", "browser", "error", "Browser is not active.")
         try:
             import time
-            screenshot_path = chatdb.default_config_dir() / f"screenshot_{int(time.time())}.png"
+            screenshot_path = paths.data_dir() / "screenshots" / f"screenshot_{int(time.time())}.png"
             screenshot_path.parent.mkdir(parents=True, exist_ok=True)
             browser_state["page"].screenshot(path=str(screenshot_path))
             runtime.state.pending_image = str(screenshot_path)
@@ -3335,6 +3380,7 @@ def build_parser() -> argparse.ArgumentParser:
     # Accept globals before the command.
     add_global_overrides(p)
 
+    p.add_argument("--version", action="version", version=f"nomadic {get_version()}")
     sub = p.add_subparsers(dest="command", required=True)
 
     # Accept globals after the command as well, without overwriting values
@@ -3343,6 +3389,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_global_overrides(sub_common, suppress_defaults=True)
 
     # serve
+    sub.add_parser("paths", help="Show where nomadic stores config, data, cache and state on this machine")
     sub.add_parser("serve", help="Start the local MLX server (mlx_vlm or mlx_lm) with inlined config params",
                    parents=[sub_common])
 
@@ -3439,8 +3486,7 @@ def main():
         if cfg.cache_dir:
             target_cache = pathlib.Path(cfg.cache_dir)
         else:
-            safe_model_name = cfg.model.replace("/", "--")
-            target_cache = chatdb.default_config_dir() / "quantized" / safe_model_name / f"{q_bits}bit"
+            target_cache = paths.quantized_cache_dir(cfg.model, q_bits)
 
         # Check if already quantized
         if pathlib.Path(cfg.model).is_dir():
@@ -3465,6 +3511,11 @@ def main():
         cfg.context_recompress_to = cfg.max_context_tokens
 
     # ── Dispatch ──────────────────────────────────────────────────────────────
+    if args.command == "paths":
+        for label, value in paths.describe().items():
+            print(f"{label:<20} {value}")
+        return 0
+
     if args.command == "serve":
         cmd_serve(cfg)
 

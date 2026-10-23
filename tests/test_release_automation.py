@@ -229,6 +229,8 @@ class BundleScriptTests(unittest.TestCase):
                     "NOMADIC_ARTIFACT_DIR": str(artifacts_dir),
                     "NOMADIC_BUNDLE_TMP_DIR": str(bundle_tmp_dir),
                     "NOMADIC_PLATFORM_ID_OVERRIDE": "linux-x86_64",
+                    # The PyInstaller build is exercised by CI's binary-smoke job; keep unit tests fast.
+                    "NOMADIC_SKIP_BINARIES": "1",
                 }
             )
 

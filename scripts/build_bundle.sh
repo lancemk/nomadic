@@ -49,21 +49,34 @@ cp "${REPO_ROOT}/GUIDE.md" "${BUNDLE_ROOT}/docs/"
 cp "${REPO_ROOT}/nomadic/storage/sql/"*.sql "${BUNDLE_ROOT}/sql/"
 
 REQUIRE_BINARIES="${NOMADIC_REQUIRE_BINARIES:-0}"
-if python3 -c "import PyInstaller" >/dev/null 2>&1; then
-  printf 'Building standalone CLI executables via PyInstaller...\n'
-  mkdir -p "${BUNDLE_ROOT}/bin"
+if [[ "${NOMADIC_SKIP_BINARIES:-0}" == "1" ]]; then
+  printf 'NOMADIC_SKIP_BINARIES=1: skipping standalone binary compilation.\n'
+elif python3 -c "import PyInstaller" >/dev/null 2>&1; then
+  printf 'Building standalone CLI via PyInstaller (onedir)...\n'
   STAMP="${REPO_ROOT}/nomadic/_version.py"
   printf '__version__ = "%s"\n' "${VERSION}" > "${STAMP}"
   trap 'rm -f "${STAMP}"' EXIT
-  PYI_COMMON=(--onefile --clean --noconfirm
+  # onedir, not onefile: a onefile binary re-extracts ~100 MB to a temp dir on EVERY launch
+  # (0.6-1.3 s on Linux, worse on macOS where each fresh file is scanned). See specs-public/PGO.md.
+  # One app serves both commands: bin/nomadic-db is a symlink and nomadic.entry dispatches on argv[0].
+  PYI_ARGS=(--onedir --clean --noconfirm --name nomadic
     --collect-all psycopg --collect-all psycopg_binary
+    --exclude-module tkinter --exclude-module unittest --exclude-module pydoc
+    --exclude-module test --exclude-module turtle --exclude-module idlelib
+    --exclude-module lib2to3 --exclude-module distutils --exclude-module setuptools --exclude-module pip
     --add-data "${REPO_ROOT}/nomadic/storage/sql:nomadic/storage/sql"
-    --workpath "${TMP_ROOT}/build" --distpath "${BUNDLE_ROOT}/bin" --specpath "${TMP_ROOT}")
-  python3 -m PyInstaller "${PYI_COMMON[@]}" --name nomadic "${REPO_ROOT}/nomadic_bin.py"
-  python3 -m PyInstaller "${PYI_COMMON[@]}" --name nomadic-db "${REPO_ROOT}/db.py"
-  # Smoke test: a binary that cannot report its version must never ship.
+    --workpath "${TMP_ROOT}/build" --distpath "${TMP_ROOT}/pyi-dist" --specpath "${TMP_ROOT}")
+  rm -rf "${TMP_ROOT}/pyi-dist"
+  python3 -m PyInstaller "${PYI_ARGS[@]}" "${REPO_ROOT}/nomadic_bin.py"
+  mkdir -p "${BUNDLE_ROOT}/bin"
+  cp -R "${TMP_ROOT}/pyi-dist/nomadic" "${BUNDLE_ROOT}/app"
+  ln -s ../app/nomadic "${BUNDLE_ROOT}/bin/nomadic"
+  ln -s ../app/nomadic "${BUNDLE_ROOT}/bin/nomadic-db"
+  # Smoke tests: a binary that cannot report its version, or starts slowly, must never ship.
   "${BUNDLE_ROOT}/bin/nomadic" --version
-  printf 'Standalone CLI executables built successfully.\n'
+  "${BUNDLE_ROOT}/bin/nomadic-db" --help >/dev/null
+  python3 "${SCRIPT_DIR}/check_startup.py" "${BUNDLE_ROOT}/bin/nomadic"
+  printf 'Standalone CLI built successfully.\n'
 elif [[ "${REQUIRE_BINARIES}" == "1" ]]; then
   printf 'NOMADIC_REQUIRE_BINARIES=1 but PyInstaller is not installed.\n' >&2
   exit 1

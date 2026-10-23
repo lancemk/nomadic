@@ -74,3 +74,6 @@ jobs:
           "${RUNNER_TEMP}"/nomadic-*-linux-x86_64/install.sh --prefix "${RUNNER_TEMP}/bin"
           "${RUNNER_TEMP}/bin/nomadic" --version
           "${RUNNER_TEMP}/bin/nomadic" --help >/dev/null
+          "${RUNNER_TEMP}/bin/nomadic-db" --help >/dev/null
+      - name: Startup-time budget (installed binary)
+        run: python scripts/check_startup.py "${RUNNER_TEMP}/bin/nomadic"

@@ -17,6 +17,21 @@ Legend: **[x]** done and covered by tests (`tests/test_srs_v03.py`, `tests/test_
 - [x] **FC-13/14/15/16:** pipeline extracted to `nomadic/quantize.py`. KV-cache term (`2·L·H_kv·D·ctx·2B`, GQA-aware) now feeds Q selection instead of a fixed 4 GB; HF token honoured for gated repos; converter verified before running; managed async subprocess streams log lines as `StatusEvent`s; failed runs delete the partial output.
 - [x] **Bug fixes found on the way:** `/agents spawn` scheduled its task on a loop that never ran (background agents never started); `/settings`, `/switch`, `/undo` only printed a warning (aliases now resolve to `/config`, `/resume`, `/rewind`); orchestrator agents crashed on `read_file` because `AgentRuntime.state` was `None`; a paused-for-review agent had its task marked COMPLETED.
 
+## Release management / startup performance (see [specs-public/PGO.md](specs-public/PGO.md))
+
+Baseline completed: root cause of the slow post-install load was PyInstaller `--onefile` re-extracting ~114 MB on every launch, plus `--version` importing the whole CLI. Measured on Linux x86_64: `--version` 1.29 s → 0.10 s, `--help` 1.42 s → 0.25 s.
+
+- [x] Frozen as onedir (`app/` + `bin/` symlinks); one app serves `nomadic` and `nomadic-db` (`nomadic/entry.py`); installer swaps `~/.local/share/nomadic/app` atomically.
+- [x] `--version` fast path, lazy package exports, deferred `requests` / `prompt_toolkit` / `rich.markdown` / `rich.syntax` (`import nomadic.cli` 421 ms → ~150 ms); guarded by `tests/test_startup.py`.
+- [x] Startup budget gate: `scripts/check_startup.py`, run in `build_bundle.sh` and CI `binary-smoke` on the installed copy.
+- [x] Pre-release channels: tags with a pre-release segment publish as GitHub pre-releases; `install.sh --channel rc|staging`; PEP 440 tag/version check; installer reads the asset name from `SHA256SUMS`.
+- [ ] Measure on `macos-14` (cold and warm) and record in PGO.md; confirm or refute per-launch scanning of onefile extractions.
+- [ ] Developer ID signing + notarisation of `app/` on macOS.
+- [ ] Relative regression gate (fail on >25 % slower than last release) and `$GITHUB_STEP_SUMMARY` publishing of startup numbers.
+- [ ] Defer remaining eager imports for non-REPL commands (`rich.console`, `nomadic.agent` → `search.metadata` → `urllib.request`) to bring frozen `--help` under 0.2 s.
+- [ ] Pilot Nuitka standalone (`--pgo-c`) against PyInstaller onedir; verify the CI interpreter was built with PGO/LTO.
+- [ ] Sign checksums / attest provenance so `install.sh` verifies origin, not just integrity.
+
 ## Open gaps
 
 ### Orchestration core

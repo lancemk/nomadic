@@ -32,6 +32,8 @@ Baseline completed: root cause of the slow post-install load was PyInstaller `--
 - [ ] Pilot Nuitka standalone (`--pgo-c`) against PyInstaller onedir; verify the CI interpreter was built with PGO/LTO.
 - [ ] Sign checksums / attest provenance so `install.sh` verifies origin, not just integrity.
 
+- [x] **MLX runtime discovery:** `nomadic/runtime.py` locates `mlx_lm` / `mlx_vlm` per module (env, pin file, managed venv, `uv tool` envs, PATH entry-point shebangs); `nomadic runtime [set|unset]`; actionable `uv tool install` errors. Model `config.json` is now read from the HF cache or the Hub over HTTP (`huggingface_hub` was never a dependency, so text models were mis-detected as VLMs in the binary).
+
 ## Open gaps
 
 ### Orchestration core

@@ -18,11 +18,15 @@ One line, no Python needed (downloads a checksummed binary from the latest GitHu
 curl -fsSL https://raw.githubusercontent.com/lancemk/nomadic/main/install.sh | bash
 ```
 
-On Apple Silicon, add `--with-mlx` to also create a managed MLX runtime so `nomadic serve` works:
+`nomadic serve` needs `mlx-lm` (text models) and/or `mlx-vlm` (vision models), installed separately on Apple Silicon. The simplest way is `uv tool`; nomadic finds those environments by itself:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/lancemk/nomadic/main/install.sh | bash -s -- --with-mlx
+uv tool install mlx-lm                  # add `--with mlx-vlm` for vision-language models
+nomadic runtime                         # shows which interpreter hosts each module
+nomadic serve
 ```
+
+Lookup order per module: `$NOMADIC_PYTHON`, a pin from `nomadic runtime set /path/to/python` (stored in `~/.config/nomadic/runtime.json`; `unset` clears it), the managed venv, `uv tool` environments (`$UV_TOOL_DIR`, `uv tool dir`, `~/.local/share/uv/tools`), then the interpreter named by the shebang of `mlx_lm.server` / `mlx_vlm.server` on `PATH` (pipx etc.). Alternatively `install.sh --with-mlx` builds a managed venv at `~/.local/share/nomadic/venv`.
 
 Options: `--version v0.2.0`, `--channel rc|staging` (newest pre-release on that channel), `--prefix DIR` (default `~/.local/bin`), `--uninstall`, `--dry-run`. The app is installed to `~/.local/share/nomadic/app` (a PyInstaller onedir, so launches don't unpack anything) with `nomadic` / `nomadic-db` symlinked into the prefix; see [specs-public/PGO.md](specs-public/PGO.md) for the startup-performance guide. Each release also attaches `SHA256SUMS` and the per-platform `nomadic-<version>-<platform>.tar.gz` bundles if you prefer to install by hand.
 

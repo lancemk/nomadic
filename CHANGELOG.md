@@ -10,6 +10,16 @@ These sections use stable markers keyed by PR number and merge commit SHA so
 reruns remain idempotent.
 <!-- nomadic:changelog-anchor -->
 
+## [0.3.2] - 2026-10-23
+<!-- nomadic:changelog pr=4 merge=ffc1a762dc6beef00550d3159f081f09198275a6 version=0.3.2 generated=2026-10-23 -->
+
+Target Branch: `main`
+PR: `#4` perf(release): onedir app, lazy imports, --version fast path, rc/staging channels, PGO guide
+
+### Commits
+- `ee19754` perf(release): ship onedir app, lazy imports, --version fast path; add PGO guide
+
+
 ## [0.3.1] - 2026-10-23
 <!-- nomadic:changelog pr=3 merge=196f27cbc6ba7a553581bf542e138c894847deeb version=0.3.1 generated=2026-10-23 -->
 

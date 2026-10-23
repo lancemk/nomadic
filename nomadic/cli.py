@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import importlib.util
 import json
 import os
 import pathlib
@@ -50,16 +51,20 @@ from typing import Any, Generator, Iterable, Optional
 # ─── optional rich ────────────────────────────────────────────────────────────
 try:
     from rich.console import Console
-    from rich.markdown import Markdown
     from rich.panel import Panel
     from rich.prompt import Prompt
     from rich.rule import Rule
-    from rich.syntax import Syntax
     _RICH = True
 except ImportError:
     _RICH = False
 
-try:
+_PROMPT_TOOLKIT = importlib.util.find_spec("prompt_toolkit") is not None
+
+
+def _load_prompt_toolkit() -> None:
+    """Import prompt_toolkit on first use; it costs ~140 ms and only the REPL needs it."""
+    if "Application" in globals():
+        return
     from prompt_toolkit.application import Application
     from prompt_toolkit.key_binding import KeyBindings
     from prompt_toolkit.layout import Layout
@@ -71,15 +76,31 @@ try:
     from prompt_toolkit.completion import WordCompleter, Completer, Completion, PathCompleter
     from prompt_toolkit.document import Document
     from prompt_toolkit.history import FileHistory
-    _PROMPT_TOOLKIT = True
-except ImportError:
-    _PROMPT_TOOLKIT = False
 
-try:
-    import requests
-    _REQUESTS = True
-except ImportError:
-    _REQUESTS = False
+    globals().update(
+        Application=Application, KeyBindings=KeyBindings, Layout=Layout, HSplit=HSplit,
+        Window=Window, FloatContainer=FloatContainer, Float=Float, Dimension=Dimension,
+        CompletionsMenu=CompletionsMenu, Style=Style, Frame=Frame, Label=Label,
+        TextArea=TextArea, WordCompleter=WordCompleter, Completer=Completer,
+        Completion=Completion, PathCompleter=PathCompleter, Document=Document,
+        FileHistory=FileHistory,
+    )
+
+
+class _LazyModule:
+    """Import a module on first attribute access (``requests`` costs ~90 ms to import)."""
+
+    def __init__(self, name: str) -> None:
+        self._name = name
+
+    def __getattr__(self, attr: str) -> Any:
+        import importlib
+
+        return getattr(importlib.import_module(self._name), attr)
+
+
+_REQUESTS = importlib.util.find_spec("requests") is not None
+requests = _LazyModule("requests")
 
 from . import agent
 from . import paths
@@ -141,24 +162,7 @@ def render_token_grid(used_pct: float, user_pct: float, assistant_pct: float, to
 
 
 
-def get_version() -> str:
-    """Resolve the version: stamped file (binaries) → source pyproject → package metadata."""
-    try:
-        from ._version import __version__
-        return __version__
-    except ImportError:
-        pass
-    try:
-        import tomllib
-        root = pathlib.Path(__file__).resolve().parent.parent / "pyproject.toml"
-        return tomllib.loads(root.read_text(encoding="utf-8"))["project"]["version"]
-    except Exception:
-        pass
-    try:
-        from importlib.metadata import version
-        return version("nomadic")
-    except Exception:
-        return "0.0.0+unknown"
+from .version import get_version  # noqa: E402,F401  (kept importable from here)
 
 
 
@@ -385,6 +389,7 @@ class UI:
     def model_output(self, text: str):
         if _RICH:
             try:
+                from rich.markdown import Markdown  # lazy: pulls in markdown_it
                 self.con.print(Markdown(text))
             except Exception:
                 self.con.print(text)
@@ -393,6 +398,7 @@ class UI:
 
     def code(self, text: str, lang: str = "python"):
         if _RICH:
+            from rich.syntax import Syntax  # lazy: pulls in pygments
             self.con.print(Syntax(text, lang, theme="monokai", line_numbers=True))
         else:
             print(text)
@@ -510,7 +516,7 @@ def resolve_next_action_selection(
     return KernelNextActionSelection(kind="none")
 
 
-if _PROMPT_TOOLKIT:
+def _bounded_history_class():
     class BoundedFileHistory(FileHistory):
         """FileHistory that truncates to a maximum length."""
         
@@ -548,6 +554,8 @@ if _PROMPT_TOOLKIT:
                     
             self._append_count = 0
 
+    return BoundedFileHistory
+
 
 class KernelInput:
     def __init__(self, ui: UI):
@@ -581,6 +589,8 @@ class KernelInput:
         return input(f"{label}: ")
 
     def _prompt_multiline(self, label: str) -> str:
+        _load_prompt_toolkit()
+        BoundedFileHistory = _bounded_history_class()
         commands = [
             "/goal", "/go", "/grill-me", "/agents", "/tasks", "/browser", 
             "/fork", "/rewind", "/undo", "/resume", "/switch", "/clear", "/rename", 

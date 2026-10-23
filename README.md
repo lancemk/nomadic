@@ -24,7 +24,7 @@ On Apple Silicon, add `--with-mlx` to also create a managed MLX runtime so `noma
 curl -fsSL https://raw.githubusercontent.com/lancemk/nomadic/main/install.sh | bash -s -- --with-mlx
 ```
 
-Options: `--version v0.2.0`, `--prefix DIR` (default `~/.local/bin`), `--uninstall`, `--dry-run`. Each release also attaches `SHA256SUMS` and the per-platform `nomadic-<version>-<platform>.tar.gz` bundles if you prefer to install by hand.
+Options: `--version v0.2.0`, `--channel rc|staging` (newest pre-release on that channel), `--prefix DIR` (default `~/.local/bin`), `--uninstall`, `--dry-run`. The app is installed to `~/.local/share/nomadic/app` (a PyInstaller onedir, so launches don't unpack anything) with `nomadic` / `nomadic-db` symlinked into the prefix; see [specs-public/PGO.md](specs-public/PGO.md) for the startup-performance guide. Each release also attaches `SHA256SUMS` and the per-platform `nomadic-<version>-<platform>.tar.gz` bundles if you prefer to install by hand.
 
 From source (development):
 
@@ -118,7 +118,7 @@ Full command details live in [GUIDE.md](GUIDE.md); history in [CHANGELOG.md](CHA
 |---|---|---|
 | `CI` | PRs to `main` / `develop/**`, pushes | pytest on Ubuntu + macOS, package build, shellcheck, binary build + `install.sh` smoke test |
 | `Post-Merge Version and Changelog` | PR merged to `main` / `develop/**` | Conventional-commit semver bump, changelog entry; on `main` also tags `vX.Y.Z` and dispatches the release |
-| `Release` | `v*` tag or manual dispatch | Tests, builds PyInstaller bundles for `macos-arm64`, `linux-x86_64`, `linux-arm64`, publishes them with `SHA256SUMS` and `install.sh` to a GitHub Release |
+| `Release` | `v*` tag or manual dispatch | Tests, builds PyInstaller onedir bundles for `macos-arm64`, `linux-x86_64`, `linux-arm64` (startup-time budget enforced), publishes them with `SHA256SUMS` and `install.sh` to a GitHub Release; tags with a pre-release segment (`v1.2.0-rc.1`) become GitHub pre-releases |
 
 Maintainer notes: the post-merge job pushes a version commit and tag to `main`, so branch protection must allow `github-actions[bot]` to push. Release bundles are named `nomadic-<version>-<platform>.tar.gz`. To build locally: `NOMADIC_REQUIRE_BINARIES=1 bash scripts/build_bundle.sh` (needs `pip install -e ".[dev]"`).
 

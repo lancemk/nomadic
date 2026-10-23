@@ -1,6 +1,6 @@
 """Module entrypoint for `python -m nomadic`."""
 
-from .cli import main
+from .entry import main
 
 
 if __name__ == "__main__":

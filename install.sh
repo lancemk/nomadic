@@ -10,6 +10,7 @@ set -euo pipefail
 
 REPO="${NOMADIC_REPO:-lancemk/nomadic}"
 VERSION="${NOMADIC_VERSION:-latest}"
+CHANNEL="${NOMADIC_CHANNEL:-stable}"
 INSTALL_DIR="${NOMADIC_INSTALL_DIR:-${HOME}/.local/bin}"
 # Mirrors nomadic/paths.py: $NOMADIC_HOME/data, else $XDG_DATA_HOME/nomadic, else ~/.local/share/nomadic.
 if [[ -n "${NOMADIC_HOME:-}" ]]; then DATA_DIR="${NOMADIC_HOME}/data"
@@ -28,6 +29,8 @@ usage() {
 Usage: install.sh [options]
 
   --version <tag|latest>  Release to install (default: latest; e.g. v0.2.0)
+  --channel <name>        stable (default) or a pre-release channel such as rc or
+                          staging: installs the newest release tagged v*-<name>*
   --prefix <dir>          Install directory for binaries (default: ~/.local/bin)
   --with-mlx              Also create a managed venv with mlx-lm/mlx-vlm for
                           `nomadic serve` (Apple Silicon only)
@@ -36,7 +39,7 @@ Usage: install.sh [options]
   --dry-run               Print actions without changing anything
   -h, --help              Show this help
 
-Environment: NOMADIC_VERSION, NOMADIC_INSTALL_DIR, NOMADIC_REPO, NOMADIC_HOME
+Environment: NOMADIC_RELEASE_BASE_URL (mirror/test override), NOMADIC_VERSION, NOMADIC_CHANNEL, NOMADIC_INSTALL_DIR, NOMADIC_REPO, NOMADIC_HOME
 (NOMADIC_HOME relocates all nomadic config/data/cache/state under one root; run
 `nomadic paths` after install to see the resolved locations.)
 EOF
@@ -46,6 +49,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --version)   VERSION="${2:?--version needs a value}"; shift 2 ;;
     --prefix)    INSTALL_DIR="${2:?--prefix needs a value}"; shift 2 ;;
+    --channel)   CHANNEL="${2:?--channel needs a value}"; shift 2 ;;
     --repo)      REPO="${2:?--repo needs a value}"; shift 2 ;;
     --with-mlx)  WITH_MLX=1; shift ;;
     --uninstall) UNINSTALL=1; shift ;;
@@ -58,7 +62,7 @@ done
 if [[ "${UNINSTALL}" == 1 ]]; then
   log "Removing nomadic from ${INSTALL_DIR}"
   run rm -f "${INSTALL_DIR}/nomadic" "${INSTALL_DIR}/nomadic-db"
-  run rm -rf "${DATA_DIR}/venv"
+  run rm -rf "${DATA_DIR}/venv" "${DATA_DIR}/app"
   log "Uninstalled. Config in ~/.config/nomadic and session databases were left untouched."
   exit 0
 fi
@@ -81,13 +85,38 @@ sha256_of() {
   else shasum -a 256 "$1" | awk '{print $1}'; fi
 }
 
+# Bundles ship a PyInstaller *onedir* app (fast start: nothing is unpacked per launch) plus
+# bin/ symlinks. Older bundles shipped single-file binaries, still handled below.
 install_binaries() {
-  local src="$1"
-  [[ -f "${src}/nomadic" ]] || die "bundle has no bin/nomadic (built without PyInstaller?)"
+  local root="$1"
   run mkdir -p "${INSTALL_DIR}"
-  run install -m 0755 "${src}/nomadic" "${INSTALL_DIR}/nomadic"
-  [[ -f "${src}/nomadic-db" ]] && run install -m 0755 "${src}/nomadic-db" "${INSTALL_DIR}/nomadic-db"
+  if [[ -x "${root}/app/nomadic" ]]; then
+    log "Installing app to ${DATA_DIR}/app"
+    run mkdir -p "${DATA_DIR}"
+    run rm -rf "${DATA_DIR}/app.new"
+    run cp -R "${root}/app" "${DATA_DIR}/app.new"
+    run rm -rf "${DATA_DIR}/app"
+    run mv "${DATA_DIR}/app.new" "${DATA_DIR}/app"
+    run ln -sfn "${DATA_DIR}/app/nomadic" "${INSTALL_DIR}/nomadic"
+    run ln -sfn "${DATA_DIR}/app/nomadic" "${INSTALL_DIR}/nomadic-db"
+  elif [[ -f "${root}/bin/nomadic" ]]; then
+    run rm -rf "${DATA_DIR}/app"
+    run rm -f "${INSTALL_DIR}/nomadic" "${INSTALL_DIR}/nomadic-db"
+    run install -m 0755 "${root}/bin/nomadic" "${INSTALL_DIR}/nomadic"
+    [[ -f "${root}/bin/nomadic-db" ]] && run install -m 0755 "${root}/bin/nomadic-db" "${INSTALL_DIR}/nomadic-db"
+  else
+    die "bundle has no app/ or bin/nomadic (built without PyInstaller?)"
+  fi
   return 0
+}
+
+# Newest release tag for a pre-release channel (e.g. rc -> v0.4.0-rc.2). The API lists newest first.
+resolve_channel_tag() {
+  local channel="$1" auth=()
+  [[ -n "${GITHUB_TOKEN:-}" ]] && auth=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
+  curl -fsSL "${auth[@]}" "https://api.github.com/repos/${REPO}/releases?per_page=50" \
+    | grep -o '"tag_name": *"[^"]*"' | sed 's/.*"\([^"]*\)"$/\1/' \
+    | grep -E -- "-${channel}" | head -n 1
 }
 
 setup_mlx() {
@@ -110,13 +139,17 @@ if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
   SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 fi
 
-if [[ -n "${SCRIPT_DIR}" && -f "${SCRIPT_DIR}/bin/nomadic" ]]; then
+if [[ -n "${SCRIPT_DIR}" && ( -x "${SCRIPT_DIR}/app/nomadic" || -f "${SCRIPT_DIR}/bin/nomadic" ) ]]; then
   # Running from an extracted release bundle.
   log "Installing from local bundle (${PLATFORM})"
-  install_binaries "${SCRIPT_DIR}/bin"
+  install_binaries "${SCRIPT_DIR}"
 else
   need curl; need tar
-  if [[ "${VERSION}" == "latest" ]]; then
+  if [[ "${VERSION}" == "latest" && "${CHANNEL}" != "stable" ]]; then
+    log "Resolving newest '${CHANNEL}' release of ${REPO}"
+    VERSION="$(resolve_channel_tag "${CHANNEL}")" || true
+    [[ -n "${VERSION}" ]] || die "no '${CHANNEL}' release found for ${REPO}"
+  elif [[ "${VERSION}" == "latest" ]]; then
     log "Resolving latest release of ${REPO}"
     final_url="$(curl -fsSL -o /dev/null -w '%{url_effective}' "https://github.com/${REPO}/releases/latest")" \
       || die "could not reach github.com/${REPO}"
@@ -124,26 +157,27 @@ else
     [[ "${VERSION}" == v* ]] || die "no published release found for ${REPO}"
   fi
   [[ "${VERSION}" == v* ]] || VERSION="v${VERSION}"
-  ASSET="nomadic-${VERSION#v}-${PLATFORM}.tar.gz"
-  BASE_URL="https://github.com/${REPO}/releases/download/${VERSION}"
+  BASE_URL="${NOMADIC_RELEASE_BASE_URL:-https://github.com/${REPO}/releases/download}/${VERSION}"
 
   WORK="$(mktemp -d)"
   trap 'rm -rf "${WORK}"' EXIT
 
-  log "Downloading ${ASSET}"
   if [[ "${DRY_RUN}" == 1 ]]; then
-    printf '[dry-run] curl %s/%s (+ SHA256SUMS), verify, extract, install to %s\n' "${BASE_URL}" "${ASSET}" "${INSTALL_DIR}"
+    printf '[dry-run] curl %s/SHA256SUMS + nomadic-*-%s.tar.gz, verify, extract, install to %s\n' "${BASE_URL}" "${PLATFORM}" "${INSTALL_DIR}"
   else
-    curl -fSL --retry 3 -o "${WORK}/${ASSET}" "${BASE_URL}/${ASSET}" \
-      || die "download failed — does ${VERSION} publish a ${PLATFORM} bundle?"
     curl -fsSL --retry 3 -o "${WORK}/SHA256SUMS" "${BASE_URL}/SHA256SUMS" \
       || die "could not fetch SHA256SUMS for ${VERSION}"
+    # The asset name carries the PEP 440 version (0.4.0rc1), which can differ from the tag
+    # spelling (v0.4.0-rc.1), so read it from the checksum list instead of deriving it.
+    ASSET="$(awk -v p="-${PLATFORM}.tar.gz" 'index($2, p) {sub(/^\*/, "", $2); print $2; exit}' "${WORK}/SHA256SUMS")"
+    [[ -n "${ASSET}" ]] || die "${VERSION} publishes no ${PLATFORM} bundle"
+    log "Downloading ${ASSET}"
+    curl -fSL --retry 3 -o "${WORK}/${ASSET}" "${BASE_URL}/${ASSET}" || die "download failed"
     expected="$(awk -v f="${ASSET}" '$2==f || $2=="*"f {print $1}' "${WORK}/SHA256SUMS")"
-    [[ -n "${expected}" ]] || die "${ASSET} not listed in SHA256SUMS"
     [[ "$(sha256_of "${WORK}/${ASSET}")" == "${expected}" ]] || die "checksum mismatch for ${ASSET}"
     log "Checksum verified"
     tar -xzf "${WORK}/${ASSET}" -C "${WORK}"
-    install_binaries "${WORK}/${ASSET%.tar.gz}/bin"
+    install_binaries "${WORK}/${ASSET%.tar.gz}"
   fi
 fi
 

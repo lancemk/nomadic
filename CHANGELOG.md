@@ -10,6 +10,18 @@ These sections use stable markers keyed by PR number and merge commit SHA so
 reruns remain idempotent.
 <!-- nomadic:changelog-anchor -->
 
+## [0.3.1] - 2026-10-23
+<!-- nomadic:changelog pr=3 merge=196f27cbc6ba7a553581bf542e138c894847deeb version=0.3.1 generated=2026-10-23 -->
+
+Target Branch: `main`
+PR: `#3` feat: reconcile nomadic layer against SRS v0.3 (storage package, FS tools, context, status, quantize)
+
+### Commits
+- `7f71fcf` Add TODO.md from README roadmap and spec-gap placeholder
+- `0645f82` Add specs-public/SRS-v0.3.md and rebuild TODO.md as SRS gap analysis
+- `c30a32b` Reconcile nomadic layer against SRS v0.3
+
+
 ## [0.3.0] - 2026-10-07
 <!-- nomadic:changelog pr=2 merge=ebbda985f62addb4ec8f092bded7684a3ba66d00 version=0.3.0 generated=2026-10-07 -->
 

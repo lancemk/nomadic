@@ -15,10 +15,13 @@ from __future__ import annotations
 
 import asyncio
 import enum
+import json
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
+
+from .status import StatusBus
 
 from . import agent as agent_mod
 from .hitl import HITLManager, ReviewDecision, ReviewResult, SafetyProfile
@@ -65,6 +68,13 @@ class AgentInstance:
     depth: int = 0
     max_depth: int = agent_mod.DEFAULT_AGENT_MAX_DEPTH
 
+    # Wiring supplied by the Orchestrator (all optional for standalone use).
+    executor: Any = None
+    status_bus: StatusBus | None = None
+    status_callback: Callable[[agent_mod.StatusEvent], None] | None = None
+    task_registry: TaskRegistry | None = None
+    db_conn: Any = None
+
     _cancel_requested: bool = field(default=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -80,6 +90,79 @@ class AgentInstance:
             AgentStatus.FAILED,
             AgentStatus.CANCELLED,
         )
+
+    # -- Runtime wiring / persistence -----------------------------------------
+
+    def _runtime(self, ui: Any) -> agent_mod.AgentRuntime:
+        runtime = agent_mod.AgentRuntime(state=None, ui=ui)
+        runtime.loop_depth = self.depth
+        runtime.status_callback = self.status_callback
+        runtime.status_bus = self.status_bus
+        return runtime
+
+    def _emit(self, state: agent_mod.LifecycleState, message: str) -> None:
+        self._runtime(None).emit(state, message)
+
+    def to_state(self) -> dict[str, Any]:
+        """Serialisable snapshot for the ``agent_states`` table."""
+        call = self.current_tool_call
+        return {
+            "agent_id": self.id,
+            "task_id": self.task.id if self.task else None,
+            "session_id": self.task.session_id if self.task else None,
+            "status": self.status.value,
+            "depth": self.depth,
+            "max_depth": self.max_depth,
+            "system_prompt": self.system_prompt,
+            "history": self.history,
+            "current_tool_call": (
+                {"name": call.name, "arguments": dict(call.arguments), "raw_json": call.raw_json}
+                if call else None
+            ),
+            "result": self.result,
+            "error": self.error,
+        }
+
+    @classmethod
+    def from_state(
+        cls,
+        state: dict[str, Any],
+        tool_registry: agent_mod.ToolRegistry,
+        *,
+        task: Task | None = None,
+        hitl_manager: HITLManager | None = None,
+    ) -> "AgentInstance":
+        """Rebuild an instance from :meth:`to_state` output (e.g. after a restart)."""
+        instance = cls(
+            id=state["agent_id"],
+            system_prompt=state.get("system_prompt", ""),
+            tool_registry=tool_registry,
+            hitl_manager=hitl_manager,
+            task=task,
+            history=list(state.get("history") or []),
+            status=AgentStatus(state.get("status", "idle")),
+            result=state.get("result"),
+            error=state.get("error"),
+            depth=int(state.get("depth", 0)),
+            max_depth=int(state.get("max_depth", agent_mod.DEFAULT_AGENT_MAX_DEPTH)),
+        )
+        call = state.get("current_tool_call")
+        if call:
+            instance.current_tool_call = agent_mod.ToolCall(
+                name=call["name"], arguments=call.get("arguments") or {}, raw_json=call.get("raw_json", ""),
+            )
+        return instance
+
+    def persist(self) -> None:
+        """Write the current state to the database (best-effort, like the task registry)."""
+        if self.db_conn is None:
+            return
+        try:
+            from .storage import db as chatdb
+
+            chatdb.upsert_agent_state(self.db_conn, self.to_state())
+        except Exception:
+            pass
 
     # -- Lifecycle -----------------------------------------------------------
 
@@ -112,11 +195,12 @@ class AgentInstance:
             return None, True
 
         self.status = AgentStatus.RUNNING
+        self._emit(agent_mod.LifecycleState.THINKING, "Thinking...")
 
         # Run the LLM completion in an executor so we never block the loop.
         loop = asyncio.get_running_loop()
         reply: str = await loop.run_in_executor(
-            None,
+            self.executor,
             lambda: complete_fn(self.history, stream=False),
         )
 
@@ -143,8 +227,7 @@ class AgentInstance:
             return note, True
 
         self.depth += 1
-        runtime = agent_mod.AgentRuntime(state=None, ui=ui)
-        runtime.loop_depth = self.depth
+        runtime = self._runtime(ui)
 
         # ── Parse error ────────────────────────────────────────────────────
         if tool_call is None:
@@ -162,6 +245,10 @@ class AgentInstance:
             tool_call.name, tool_call.arguments,
         ):
             self.status = AgentStatus.AWAITING_REVIEW
+            self._emit(
+                agent_mod.LifecycleState.REVIEWING,
+                f"Awaiting user review of {tool_call.name}...",
+            )
             self.hitl_manager.create_review_request(
                 tool_name=tool_call.name,
                 arguments=tool_call.arguments,
@@ -169,11 +256,14 @@ class AgentInstance:
                 agent_id=self.id,
                 depth=self.depth,
             )
+            self.persist()
             # Caller must resolve the review before continuing.
             return None, False
 
-        # ── Execute tool ───────────────────────────────────────────────────
-        result = self._execute_tool(tool_call, runtime)
+        # ── Execute tool (blocking tools run off the event loop) ───────────
+        result = await loop.run_in_executor(
+            self.executor, self._execute_tool, tool_call, runtime,
+        )
         self._inject_tool_result(result)
         self._track_artifact(tool_call, result)
         self.current_tool_call = None
@@ -227,8 +317,7 @@ class AgentInstance:
         if decision == ReviewDecision.APPROVE:
             # Execute the previously intercepted tool call.
             if self.current_tool_call:
-                runtime = agent_mod.AgentRuntime(state=None, ui=ui)
-                runtime.loop_depth = self.depth
+                runtime = self._runtime(ui)
                 result = self._execute_tool(self.current_tool_call, runtime)
                 self._inject_tool_result(result)
                 self._track_artifact(self.current_tool_call, result)
@@ -241,8 +330,7 @@ class AgentInstance:
                 arguments=modified_args,
                 raw_json=self.current_tool_call.raw_json,
             )
-            runtime = agent_mod.AgentRuntime(state=None, ui=ui)
-            runtime.loop_depth = self.depth
+            runtime = self._runtime(ui)
             result = self._execute_tool(modified_call, runtime)
             self._inject_tool_result(result)
             self._track_artifact(modified_call, result)
@@ -287,21 +375,20 @@ class AgentInstance:
         tool_call: agent_mod.ToolCall,
         result: agent_mod.ToolExecutionResult,
     ) -> None:
-        """Record artifacts produced by tool execution in the linked task."""
-        if self.task is None:
+        """Record files created/modified by file tools in the linked task (FC-4)."""
+        if self.task is None or result.status != "ok":
             return
-        if result.status != "ok":
+        if tool_call.name not in ("write_file", "replace_content"):
             return
-        # Heuristic: track file-producing or shell tools
-        if tool_call.name in ("write_file", "exec_shell"):
-            path = tool_call.arguments.get(
-                "path",
-                tool_call.arguments.get("command", ""),
-            )
-            if path:
-                self.task.artifacts.append(
-                    TaskArtifact(path=str(path), action="modified"),
-                )
+        payload = result.payload or {}
+        path = payload.get("path") or tool_call.arguments.get("path")
+        if not path:
+            return
+        action = str(payload.get("action") or "modified")
+        if self.task_registry is not None:
+            self.task_registry.add_artifact(self.task.id, str(path), action)
+        else:
+            self.task.artifacts.append(TaskArtifact(path=str(path), action=action))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -326,6 +413,9 @@ class Orchestrator:
         hitl_manager: HITLManager | None = None,
         task_registry: TaskRegistry | None = None,
         max_parallel: int = 4,
+        db_conn: Any = None,
+        status_bus: StatusBus | None = None,
+        status_callback: Callable[[agent_mod.StatusEvent], None] | None = None,
     ):
         self._default_prompt = (
             default_system_prompt or agent_mod.default_system_prompt()
@@ -334,10 +424,14 @@ class Orchestrator:
             default_tool_registry or agent_mod.build_default_registry()
         )
         self._hitl = hitl_manager or HITLManager()
-        self._tasks = task_registry or TaskRegistry()
+        self._tasks = task_registry or TaskRegistry(db_conn)
         self._agents: dict[str, AgentInstance] = {}
         self._executor = ThreadPoolExecutor(max_workers=max_parallel)
+        self._process_pool: Any = None  # created lazily by run_blocking(use_process=True)
         self._max_parallel = max_parallel
+        self._db_conn = db_conn
+        self._status_bus = status_bus if status_bus is not None else StatusBus()
+        self._status_callback = status_callback
 
     # -- Properties ----------------------------------------------------------
 
@@ -352,6 +446,18 @@ class Orchestrator:
     @property
     def hitl_manager(self) -> HITLManager:
         return self._hitl
+
+    @property
+    def status_bus(self) -> StatusBus:
+        return self._status_bus
+
+    def _wire(self, instance: AgentInstance) -> AgentInstance:
+        instance.executor = self._executor
+        instance.status_bus = self._status_bus
+        instance.status_callback = self._status_callback
+        instance.task_registry = self._tasks
+        instance.db_conn = self._db_conn
+        return instance
 
     # -- Agent lifecycle -----------------------------------------------------
 
@@ -377,9 +483,106 @@ class Orchestrator:
         # Seed the conversation with the task objective.
         instance.add_user_message(task.objective)
 
+        self._wire(instance)
         self._agents[agent_id] = instance
         self._tasks.assign_agent(task.id, agent_id)
+        instance.persist()
         return instance
+
+    def restore_agents(self, session_id: str | None = None) -> list[AgentInstance]:
+        """Rebuild non-terminal agents from the ``agent_states`` table after a restart."""
+        if self._db_conn is None:
+            return []
+        from .storage import db as chatdb
+
+        restored: list[AgentInstance] = []
+        for state in chatdb.list_agent_states(self._db_conn, session_id=session_id):
+            if state["agent_id"] in self._agents:
+                continue
+            if AgentStatus(state["status"]) in (
+                AgentStatus.COMPLETED, AgentStatus.FAILED, AgentStatus.CANCELLED,
+            ):
+                continue
+            task = self._tasks.get_task(state["task_id"]) if state.get("task_id") else None
+            instance = AgentInstance.from_state(
+                state, self._default_registry, task=task, hitl_manager=self._hitl,
+            )
+            self._agents[instance.id] = self._wire(instance)
+            call = instance.current_tool_call
+            if instance.status == AgentStatus.AWAITING_REVIEW and call is not None:
+                self._hitl.create_review_request(
+                    tool_name=call.name,
+                    arguments=call.arguments,
+                    raw_json=call.raw_json,
+                    agent_id=instance.id,
+                    depth=instance.depth,
+                )
+            restored.append(instance)
+        return restored
+
+    async def run_blocking(self, fn: Callable[..., Any], *args: Any, use_process: bool = False) -> Any:
+        """Run a long local job off the event loop (thread pool, or process pool when picklable)."""
+        loop = asyncio.get_running_loop()
+        if use_process:
+            if self._process_pool is None:
+                from concurrent.futures import ProcessPoolExecutor
+
+                self._process_pool = ProcessPoolExecutor(max_workers=self._max_parallel)
+            return await loop.run_in_executor(self._process_pool, fn, *args)
+        return await loop.run_in_executor(self._executor, fn, *args)
+
+    def shutdown(self) -> None:
+        self._executor.shutdown(wait=False, cancel_futures=True)
+        if self._process_pool is not None:
+            self._process_pool.shutdown(wait=False, cancel_futures=True)
+
+    # -- Agent-to-agent hand-off (FC-2) --------------------------------------
+
+    def handoff(
+        self,
+        from_agent_id: str,
+        objective: str,
+        *,
+        evidence: str = "",
+    ) -> AgentInstance:
+        """Delegate a sub-task from one agent to a new child agent.
+
+        A child task is registered under the parent's task, and the child is
+        seeded with the objective plus the *evidence* the parent has gathered.
+        """
+        parent = self._agents.get(from_agent_id)
+        if parent is None:
+            raise ValueError(f"No active agent with id={from_agent_id!r}")
+        child_task = self._tasks.create_task(
+            objective,
+            session_id=parent.task.session_id if parent.task else None,
+            parent_task_id=parent.task.id if parent.task else None,
+            metadata={"handoff_from": from_agent_id},
+        )
+        child = self.spawn_agent(child_task)
+        if evidence:
+            child.add_user_message(f"Evidence from {from_agent_id}:\n{evidence}")
+        return child
+
+    async def run_handoff(
+        self,
+        from_agent_id: str,
+        objective: str,
+        complete_fn: Callable[..., str],
+        ui: Any,
+        *,
+        evidence: str = "",
+    ) -> str:
+        """Hand off a sub-task, run the child to completion, and return its result to the parent."""
+        child = self.handoff(from_agent_id, objective, evidence=evidence)
+        result = await self.run_agent(child.id, complete_fn, ui)
+        parent = self._agents[from_agent_id]
+        parent.history.append({
+            "role": "tool",
+            "content": f"[handoff {child.id}] {result}",
+        })
+        parent.persist()
+        return result
 
     async def run_agent(
         self,
@@ -394,6 +597,9 @@ class Orchestrator:
 
         try:
             result = await instance.run(complete_fn, ui)
+            instance.persist()
+            if instance.status == AgentStatus.AWAITING_REVIEW:
+                return result  # paused for HITL; the task stays ACTIVE
             if instance.task:
                 self._tasks.update_status(
                     instance.task.id,
@@ -404,6 +610,7 @@ class Orchestrator:
         except Exception as exc:
             instance.status = AgentStatus.FAILED
             instance.error = str(exc)
+            instance.persist()
             if instance.task:
                 self._tasks.update_status(
                     instance.task.id,
@@ -434,6 +641,7 @@ class Orchestrator:
         if instance is None:
             return False
         instance.cancel()
+        instance.persist()
         if instance.task:
             self._tasks.cancel_task(instance.task.id)
         return True

@@ -6,6 +6,8 @@
 
 `nomadic` is a terminal kernel where the agent is the primary interface. It talks to a local MLX model server (`mlx_vlm` / `mlx_lm`), gives the model structured tools, records everything in SQLite or Postgres, and lets you run, review, fork, and rewind agent work.
 
+**Requires:** Python 3.12+ (when installing from source).
+
 **Status:** early public OSS / active prototype. **Runtime support:** Apple Silicon (inference). The CLI itself ships for macOS arm64 and Linux x86_64/arm64 (e.g. to point at a remote OpenAI-compatible server); local MLX inference is macOS arm64 only.
 
 ## Install
@@ -142,7 +144,7 @@ Uninstall: `install.sh --uninstall` removes the binaries and the MLX venv, and l
 
 ## Session storage
 
-SQLite for local-first use; Postgres for shared or durable setups (`docker compose up -d postgres`, then `nomadic initialize --db-kind postgres --postgres-dsn postgresql://nomadic:nomadic@127.0.0.1:5432/nomadic`). The schema ships inside the package (`nomadic/sql/*.sql`) and in the binary, so `nomadic-db init` needs no external files. Any setting can be overridden per run with flags.
+SQLite for local-first use; Postgres for shared or durable setups (`docker compose up -d postgres`, then `nomadic initialize --db-kind postgres --postgres-dsn postgresql://nomadic:nomadic@127.0.0.1:5432/nomadic`). Persistence lives in `nomadic/storage/`. The schema ships inside the package (`nomadic/storage/sql/*.sql`) and in the binary, so `nomadic-db init` needs no external files. Any setting can be overridden per run with flags.
 
 ## Roadmap
 

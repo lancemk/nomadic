@@ -62,20 +62,29 @@ class AgentRuntime:
     shell_timeout_seconds: int = DEFAULT_SHELL_TIMEOUT_SECONDS
     max_tool_output_chars: int = DEFAULT_TOOL_OUTPUT_CHARS
     status_callback: Callable[[StatusEvent], None] | None = None
+    status_bus: Any = None  # nomadic.status.StatusBus (optional)
+
+    def _cfg(self, name: str, default: Any) -> Any:
+        cfg = getattr(self.state, "cfg", None)
+        return getattr(cfg, name, default)
 
     @property
     def max_skill_chars(self) -> int:
-        return int(getattr(self.state.cfg, "max_skill_chars", 12_000))
+        return int(self._cfg("max_skill_chars", 12_000))
 
     @property
     def metadata_base_url(self) -> str:
-        return str(
-            getattr(
-                self.state.cfg,
-                "metadata_base_url",
-                metadata_search.DEFAULT_METADATA_BASE_URL,
-            )
-        )
+        return str(self._cfg("metadata_base_url", metadata_search.DEFAULT_METADATA_BASE_URL))
+
+    def emit(self, state: "LifecycleState", message: str) -> None:
+        """Publish a status event to the callback and/or bus (never raises)."""
+        event = StatusEvent(state, message, self.loop_depth)
+        for sink in (self.status_callback, getattr(self.status_bus, "publish", None)):
+            if sink is not None:
+                try:
+                    sink(event)
+                except Exception:
+                    pass
 
 
 ToolHandler = Callable[[Mapping[str, Any], AgentRuntime], ToolExecutionResult]
@@ -210,87 +219,6 @@ def _render_exec_shell_result(payload: Mapping[str, Any]) -> str:
 def _render_metadata_search_result(payload: Mapping[str, Any]) -> str:
     return metadata_search.render_metadata_search_result(dict(payload))
 
-def _handle_read_file(arguments: Mapping[str, Any], runtime: AgentRuntime) -> ToolExecutionResult:
-    path = arguments.get("path")
-    if not isinstance(path, str) or not path.strip():
-        raise ValueError("read_file requires a string path")
-    start_line = arguments.get("start_line")
-    end_line = arguments.get("end_line")
-    
-    p = pathlib.Path(path.strip())
-    if not p.exists():
-        raise FileNotFoundError(f"File not found: {p}")
-        
-    lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
-    if isinstance(start_line, int) and isinstance(end_line, int):
-        content = "\n".join(lines[start_line-1:end_line])
-    else:
-        content = "\n".join(lines)
-        
-    if len(content) > runtime.max_skill_chars:
-        content = content[:runtime.max_skill_chars] + "\n\n[... truncated ...]"
-        
-    return ToolExecutionResult(
-        tool_name="read_file",
-        label=f"read_file: {path}",
-        status="ok",
-        content=f"Path: {path}\nContent:\n{content}",
-        payload={"path": path, "content": content},
-    )
-
-def _handle_write_file(arguments: Mapping[str, Any], runtime: AgentRuntime) -> ToolExecutionResult:
-    path = arguments.get("path")
-    content = arguments.get("content")
-    if not path or not isinstance(content, str):
-        raise ValueError("write_file requires path and content")
-    p = pathlib.Path(path.strip())
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(content, encoding="utf-8")
-    return ToolExecutionResult(
-        tool_name="write_file",
-        label=f"write_file: {path}",
-        status="ok",
-        content=f"Successfully wrote to {path}",
-        payload={"path": str(path)}
-    )
-
-def _handle_replace_content(arguments: Mapping[str, Any], runtime: AgentRuntime) -> ToolExecutionResult:
-    path = arguments.get("path")
-    target = arguments.get("target")
-    replacement = arguments.get("replacement")
-    if not path or not target or type(replacement) is not str:
-        raise ValueError("replace_content requires path, target, and replacement")
-    p = pathlib.Path(path.strip())
-    if not p.exists():
-        raise FileNotFoundError(f"File not found: {p}")
-    text = p.read_text(encoding="utf-8")
-    if target not in text:
-        raise ValueError("Target string not found in file")
-    text = text.replace(target, replacement)
-    p.write_text(text, encoding="utf-8")
-    return ToolExecutionResult(
-        tool_name="replace_content",
-        label=f"replace_content: {path}",
-        status="ok",
-        content=f"Successfully replaced content in {path}",
-        payload={"path": str(path)}
-    )
-
-def _handle_list_dir(arguments: Mapping[str, Any], runtime: AgentRuntime) -> ToolExecutionResult:
-    path = arguments.get("path", ".")
-    p = pathlib.Path(path.strip())
-    if not p.exists() or not p.is_dir():
-        raise FileNotFoundError(f"Directory not found: {p}")
-    items = sorted([str(item.relative_to(p)) for item in p.rglob("*") if item.is_file()])
-    return ToolExecutionResult(
-        tool_name="list_dir",
-        label=f"list_dir: {path}",
-        status="ok",
-        content=f"Directory contents of {path} (recursive files):\n" + "\n".join(items[:500]),
-        payload={"path": str(path)}
-    )
-
-
 def _handle_read_skill(arguments: Mapping[str, Any], runtime: AgentRuntime) -> ToolExecutionResult:
     path = arguments.get("path")
     if not isinstance(path, str) or not path.strip():
@@ -345,6 +273,18 @@ def _handle_metadata_search(arguments: Mapping[str, Any], runtime: AgentRuntime)
         content=_render_metadata_search_result(payload),
         payload=dict(payload),
     )
+
+
+_TOOL_STATES = {
+    "read_skill": LifecycleState.READING,
+    "metadata_search": LifecycleState.READING,
+    "read_file": LifecycleState.READING,
+    "list_dir": LifecycleState.READING,
+    "write_file": LifecycleState.WRITING,
+    "replace_content": LifecycleState.EDITING,
+    "exec_shell": LifecycleState.EXECUTING,
+}
+_FS_TOOLS = {"read_file", "list_dir", "write_file", "replace_content"}
 
 
 class ToolRegistry:
@@ -415,20 +355,23 @@ class ToolRegistry:
         if tool is None:
             raise ValueError(f"Unknown tool: {tool_call.name}")
             
-        if runtime and runtime.status_callback:
-            if tool.name in ("read_skill", "metadata_search"):
-                runtime.status_callback(StatusEvent(LifecycleState.READING, f"Reading {tool_call.arguments}", runtime.loop_depth))
-            elif tool.name == "exec_shell":
-                runtime.status_callback(StatusEvent(LifecycleState.EXECUTING, f"Running {tool_call.arguments.get('command')}", runtime.loop_depth))
-            elif tool.name in ("write_file", "replace_content"):
-                runtime.status_callback(StatusEvent(LifecycleState.WRITING, f"Writing {tool_call.arguments.get('path')}", runtime.loop_depth))
+        if runtime is not None:
+            state = _TOOL_STATES.get(tool.name, LifecycleState.EXECUTING)
+            if tool.name == "exec_shell":
+                runtime.emit(state, f"Running {tool_call.arguments.get('command')}")
+            elif tool.name in _FS_TOOLS:
+                pass  # fs handlers emit richer events (line numbers) themselves
+            elif state is LifecycleState.READING:
+                runtime.emit(state, f"Reading {tool_call.arguments}")
             else:
-                runtime.status_callback(StatusEvent(LifecycleState.EXECUTING, f"Running {tool.name}...", runtime.loop_depth))
-                
+                runtime.emit(state, f"Running {tool.name}...")
+
         return tool.handler(tool_call.arguments, runtime)
 
 
 def build_default_registry() -> ToolRegistry:
+    from .tools import fs  # local import: fs depends on this module
+
     return ToolRegistry(
         [
             ToolDefinition(
@@ -484,63 +427,7 @@ def build_default_registry() -> ToolRegistry:
                 },
                 handler=_handle_metadata_search,
             ),
-            ToolDefinition(
-                name="read_file",
-                description="Read contents of a file.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string"},
-                        "start_line": {"type": "integer"},
-                        "end_line": {"type": "integer"}
-                    },
-                    "required": ["path"],
-                    "additionalProperties": False,
-                },
-                handler=_handle_read_file,
-            ),
-            ToolDefinition(
-                name="write_file",
-                description="Create or overwrite a file with content.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string"},
-                        "content": {"type": "string"}
-                    },
-                    "required": ["path", "content"],
-                    "additionalProperties": False,
-                },
-                handler=_handle_write_file,
-            ),
-            ToolDefinition(
-                name="replace_content",
-                description="Replace exact string matches in a file.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string"},
-                        "target": {"type": "string"},
-                        "replacement": {"type": "string"}
-                    },
-                    "required": ["path", "target", "replacement"],
-                    "additionalProperties": False,
-                },
-                handler=_handle_replace_content,
-            ),
-            ToolDefinition(
-                name="list_dir",
-                description="List all files in a directory.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string"}
-                    },
-                    "required": ["path"],
-                    "additionalProperties": False,
-                },
-                handler=_handle_list_dir,
-            ),
+            *fs.get_tools(),
         ]
     )
 

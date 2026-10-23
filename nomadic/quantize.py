@@ -18,6 +18,7 @@ from typing import Any, Callable, Optional
 
 from . import paths
 from .agent import LifecycleState, StatusEvent
+from .runtime import runtime_python  # noqa: F401  (re-exported)
 
 StatusSink = Callable[[StatusEvent], None]
 
@@ -40,28 +41,6 @@ def normalize_model_name(model_name: str) -> str:
     if cleaned.startswith("models/"):
         cleaned = cleaned[7:]
     return cleaned
-
-
-def runtime_python() -> str:
-    """Interpreter that hosts the MLX runtime (mlx_lm / mlx_vlm).
-
-    From source this is the current interpreter. In a PyInstaller binary
-    ``sys.executable`` is the binary itself, so resolve the managed runtime
-    venv created by ``install.sh --with-mlx`` (or ``$NOMADIC_PYTHON``).
-    """
-    override = os.environ.get("NOMADIC_PYTHON")
-    if override:
-        return override
-    if not getattr(sys, "frozen", False):
-        return sys.executable
-    home = paths.data_dir()
-    for candidate in (home / "venv" / "bin" / "python", home / "venv" / "Scripts" / "python.exe"):
-        if candidate.exists():
-            return str(candidate)
-    raise RuntimeError(
-        "MLX runtime not found. Run `install.sh --with-mlx` (Apple Silicon) "
-        "or set NOMADIC_PYTHON to a Python with mlx-lm/mlx-vlm installed."
-    )
 
 
 # ── FC-13: system resource auditor ─────────────────────────────────────────
@@ -89,28 +68,55 @@ def hf_token() -> Optional[str]:
     return os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or None
 
 
+_CONFIG_CACHE: dict[str, Optional[dict[str, Any]]] = {}
+
+
+def _hub_cache_config(repo_id: str) -> Optional[pathlib.Path]:
+    """Newest cached ``config.json`` for ``repo_id`` in the Hugging Face cache (no network)."""
+    hub = os.environ.get("HF_HUB_CACHE") or (
+        pathlib.Path(os.environ["HF_HOME"]) / "hub" if os.environ.get("HF_HOME")
+        else pathlib.Path.home() / ".cache" / "huggingface" / "hub"
+    )
+    snaps = pathlib.Path(hub) / ("models--" + repo_id.replace("/", "--")) / "snapshots"
+    found = sorted(snaps.glob("*/config.json"), key=lambda p: p.stat().st_mtime, reverse=True) if snaps.is_dir() else []
+    return found[0] if found else None
+
+
+def _hub_download_config(repo_id: str) -> Optional[dict[str, Any]]:
+    """Fetch ``config.json`` straight from the Hub (``huggingface_hub`` is not a nomadic dependency)."""
+    import requests
+
+    endpoint = os.environ.get("HF_ENDPOINT", "https://huggingface.co").rstrip("/")
+    headers = {"Authorization": f"Bearer {hf_token()}"} if hf_token() else {}
+    try:
+        resp = requests.get(f"{endpoint}/{repo_id}/resolve/main/config.json", headers=headers, timeout=10)
+        return resp.json() if resp.ok else None
+    except Exception:
+        return None
+
+
 def load_model_config(model_path: str) -> Optional[dict[str, Any]]:
-    """Read ``config.json`` from a local directory or the Hugging Face Hub."""
+    """Read ``config.json`` from a local directory, the Hugging Face cache, or the Hub (memoised)."""
     model_path = normalize_model_name(model_path)
+    if model_path in _CONFIG_CACHE:
+        return _CONFIG_CACHE[model_path]
+    result: Optional[dict[str, Any]] = None
     local_path = pathlib.Path(model_path)
     config_file: Optional[pathlib.Path] = None
     if local_path.is_dir():
         config_file = local_path / "config.json"
     else:
+        config_file = _hub_cache_config(model_path)
+    if config_file is not None and config_file.exists():
         try:
-            from huggingface_hub import hf_hub_download
-
-            config_file = pathlib.Path(
-                hf_hub_download(repo_id=model_path, filename="config.json", token=hf_token())
-            )
+            result = json.loads(config_file.read_text(encoding="utf-8"))
         except Exception:
-            return None
-    if config_file is None or not config_file.exists():
-        return None
-    try:
-        return json.loads(config_file.read_text(encoding="utf-8"))
-    except Exception:
-        return None
+            result = None
+    elif not local_path.is_dir():
+        result = _hub_download_config(model_path)
+    if result is not None:
+        _CONFIG_CACHE[model_path] = result
+    return result
 
 
 def estimate_parameters_from_config(cfg_dict: dict) -> Optional[float]:
@@ -208,7 +214,7 @@ def is_text_only_model(model_path: str) -> bool:
 def build_convert_command(model_path: str, q_bits: int, out_dir: pathlib.Path) -> list[str]:
     module_name = "mlx_lm" if is_text_only_model(model_path) else "mlx_vlm"
     return [
-        runtime_python(), "-m", module_name, "convert",
+        runtime_python(module_name), "-m", module_name, "convert",
         "--hf-path", model_path,
         "-q",
         "--q-bits", str(q_bits),
@@ -219,13 +225,13 @@ def build_convert_command(model_path: str, q_bits: int, out_dir: pathlib.Path) -
 def verify_converter(module_name: str) -> None:
     """Fail early with an actionable message when ``mlx-lm`` / ``mlx-vlm`` is missing."""
     probe = subprocess.run(
-        [runtime_python(), "-c", f"import importlib.util, sys; sys.exit(importlib.util.find_spec('{module_name}') is None)"],
+        [runtime_python(module_name), "-c", f"import importlib.util, sys; sys.exit(importlib.util.find_spec('{module_name}') is None)"],
         capture_output=True,
     )
     if probe.returncode != 0:
         raise RuntimeError(
-            f"{module_name} is not installed in the MLX runtime ({runtime_python()}). "
-            'Install it with `pip install -e ".[mlx]"` or `install.sh --with-mlx`.'
+            f"{module_name} is not installed in the MLX runtime ({runtime_python(module_name)}). "
+            f"Install it with `uv tool install {module_name.replace('_', '-')}` or run `nomadic runtime`."
         )
 
 

@@ -339,7 +339,7 @@ def test_quantization_streams_status_events_and_cleans_up(tmp_path, monkeypatch)
     script.write_text("import sys\nprint('loading')\nprint('quantizing layer 1')\nsys.exit(int(sys.argv[-1] == 'fail'))\n")
     monkeypatch.setattr(quantize, "verify_converter", lambda m: None)
     monkeypatch.setattr(quantize, "is_text_only_model", lambda m: True)
-    monkeypatch.setattr(quantize, "runtime_python", lambda: __import__("sys").executable)
+    monkeypatch.setattr(quantize, "runtime_python", lambda module=None: __import__("sys").executable)
     monkeypatch.setattr(
         quantize, "build_convert_command",
         lambda m, q, d: [__import__("sys").executable, str(script), "ok" if m == "good" else "fail"],

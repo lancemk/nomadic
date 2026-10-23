@@ -189,4 +189,14 @@ case ":${PATH}:" in
   *) warn "${INSTALL_DIR} is not on your PATH. Add: export PATH=\"${INSTALL_DIR}:\$PATH\"" ;;
 esac
 [[ "${DRY_RUN}" == 1 ]] || "${INSTALL_DIR}/nomadic" --version || true
-[[ "${WITH_MLX}" == 1 ]] || log "Tip: re-run with --with-mlx on Apple Silicon to enable \`nomadic serve\`."
+if [[ "${DRY_RUN}" != 1 ]]; then
+  # nomadic finds mlx-lm / mlx-vlm in a `uv tool` environment (or the managed venv) on its own.
+  if ! "${INSTALL_DIR}/nomadic" runtime >/dev/null 2>&1; then
+    log "MLX runtime not found (needed for \`nomadic serve\`). Install it with one of:"
+    log "  uv tool install mlx-lm            # add: --with mlx-vlm   for vision models"
+    log "  install.sh --with-mlx             # managed venv"
+    log "Then check with: nomadic runtime"
+  else
+    "${INSTALL_DIR}/nomadic" runtime || true
+  fi
+fi

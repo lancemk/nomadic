@@ -36,6 +36,7 @@ import base64
 import importlib.util
 import json
 import os
+import shutil
 import pathlib
 import re
 import subprocess
@@ -262,14 +263,14 @@ class ServerConfig:
         """Arguments passed to the local server command."""
         if is_text_only_model(self.model):
             return [
-                runtime_python(), "-m", "mlx_lm", "server",
+                runtime_python("mlx_lm"), "-m", "mlx_lm", "server",
                 "--model",       self.model,
                 "--host",        self.host,
                 "--port",        str(self.port),
             ]
         else:
             return [
-                runtime_python(), "-m", "mlx_vlm", "server",
+                runtime_python("mlx_vlm"), "-m", "mlx_vlm", "server",
                 "--model",       self.model,
                 "--host",        self.host,
                 "--port",        str(self.port),
@@ -1203,6 +1204,34 @@ def cmd_serve(cfg: ServerConfig):
         sys.exit(proc.returncode)
     except KeyboardInterrupt:
         ui.info("Server stopped.")
+
+
+def cmd_runtime(action: str, python: Optional[str]) -> int:
+    """Show where mlx-lm / mlx-vlm are found, or pin / unpin an interpreter."""
+    from . import runtime
+
+    if action == "set":
+        if not python or not (pathlib.Path(python).expanduser().exists() or shutil.which(python)):
+            print(f"error: `nomadic runtime set` needs an existing interpreter path (got {python!r})", file=sys.stderr)
+            return 2
+        resolved = str(pathlib.Path(python).expanduser())
+        print(f"Pinned {resolved} in {runtime.pin_python(resolved)}")
+    elif action == "unset":
+        runtime.pin_python(None)
+        print("Cleared the pinned runtime.")
+    pinned = runtime.pinned_python()
+    if os.environ.get("NOMADIC_PYTHON"):
+        print(f"{'NOMADIC_PYTHON':<10} {os.environ['NOMADIC_PYTHON']}")
+    if pinned:
+        print(f"{'pinned':<10} {pinned}  ({runtime.config_file()})")
+    missing = 0
+    for module, found in runtime.report().items():
+        if found:
+            print(f"{module:<10} {found.python}  [{found.source}]")
+        else:
+            missing += 1
+            print(f"{module:<10} not found  (install: uv tool install {module.replace('_', '-')})")
+    return 0 if missing < len(runtime.MLX_MODULES) else 1
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3242,6 +3271,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     # serve
     sub.add_parser("paths", help="Show where nomadic stores config, data, cache and state on this machine")
+    runtime_p = sub.add_parser("runtime", help="Show or pin the Python environment hosting mlx-lm / mlx-vlm")
+    runtime_p.add_argument("action", nargs="?", choices=("show", "set", "unset"), default="show")
+    runtime_p.add_argument("python", nargs="?", help="interpreter to pin (for `set`)")
     sub.add_parser("serve", help="Start the local MLX server (mlx_vlm or mlx_lm) with inlined config params",
                    parents=[sub_common])
 
@@ -3361,6 +3393,9 @@ def main():
         for label, value in paths.describe().items():
             print(f"{label:<20} {value}")
         return 0
+
+    if args.command == "runtime":
+        return cmd_runtime(args.action, args.python)
 
     if args.command == "serve":
         cmd_serve(cfg)

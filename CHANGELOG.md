@@ -10,6 +10,16 @@ These sections use stable markers keyed by PR number and merge commit SHA so
 reruns remain idempotent.
 <!-- nomadic:changelog-anchor -->
 
+## [0.3.3] - 2026-10-23
+<!-- nomadic:changelog pr=5 merge=3c31a51c05e02e694f2023ba1295a2d430963d3b version=0.3.3 generated=2026-10-23 -->
+
+Target Branch: `main`
+PR: `#5` fix(runtime): find mlx-lm/mlx-vlm in uv tool environments
+
+### Commits
+- `b26a601` fix(runtime): discover mlx-lm/mlx-vlm in uv tool environments; add `nomadic runtime`
+
+
 ## [0.3.2] - 2026-10-23
 <!-- nomadic:changelog pr=4 merge=ffc1a762dc6beef00550d3159f081f09198275a6 version=0.3.2 generated=2026-10-23 -->
 

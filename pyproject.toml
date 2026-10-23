@@ -7,7 +7,7 @@ name = "nomadic"
 version = "0.3.0"
 description = "Agent-first local REPL: multi-agent orchestration, HITL safety review, persistent sessions and task registry on Apple Silicon."
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.12"
 license = { file = "LICENSE.md" }
 keywords = ["agent", "repl", "mlx", "apple-silicon", "local-llm", "cli"]
 classifiers = [
@@ -40,7 +40,7 @@ Changelog = "https://github.com/lancemk/nomadic/blob/main/CHANGELOG.md"
 
 [project.scripts]
 nomadic = "nomadic.cli:main"
-nomadic-db = "nomadic.db:main"
+nomadic-db = "nomadic.storage.db:main"
 
 [tool.setuptools]
 include-package-data = true
@@ -49,4 +49,4 @@ include-package-data = true
 include = ["nomadic*"]
 
 [tool.setuptools.package-data]
-nomadic = ["sql/*.sql"]
+"nomadic.storage" = ["sql/*.sql"]

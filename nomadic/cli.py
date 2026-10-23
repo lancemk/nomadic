@@ -40,6 +40,7 @@ import re
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 import os
 import readline  # noqa: F401 — enables arrow-key history in input()
@@ -82,42 +83,33 @@ except ImportError:
 
 from . import agent
 from . import paths
-from . import db as chatdb
+from .storage import db as chatdb
+from .context import resolve_file_references
+from .quantize import (  # noqa: F401  (re-exported for callers and tests)
+    cached_model_dir,
+    detect_parameters_from_name,
+    determine_optimal_q_bits,
+    estimate_parameters_from_config,
+    get_safe_memory_budget,
+    is_text_only_model,
+    normalize_model_name,
+    resolve_q_bits,
+    run_quantization,
+    runtime_python,
+)
 from .hitl import HITLManager, SafetyProfile, ReviewDecision
 from .tasks import TaskRegistry, TaskStatus
 from .orchestrator import Orchestrator, AgentInstance, AgentStatus
 
+# Aliases resolved before dispatch so each has exactly one handler.
+COMMAND_ALIASES = {"/settings": "/config", "/switch": "/resume", "/undo": "/rewind"}
 _MEMORY_NOTE_PREFIX = "[KERNEL MEMORY SUMMARY]"
 _KERNEL_INPUT_ACCENT = "#ea7100"
 _KERNEL_EXIT_ARM_WINDOW_SECONDS = 2.0
 
 
-def normalize_model_name(model_name: str) -> str:
-    """
-    Normalize model name to match huggingface-cli / hf download repo-id.
-    Strips hf:// prefix and optional repo type prefix (e.g. models/).
-    """
-    cleaned = model_name.strip()
-    if cleaned.startswith("hf://"):
-        cleaned = cleaned[5:]
-    if cleaned.startswith("models/"):
-        cleaned = cleaned[7:]
-    return cleaned
 
 
-def get_safe_memory_budget() -> float:
-    """
-    Returns the safe memory budget in GB for inference,
-    reserving at least 8GB or 25% of total unified memory for the OS.
-    """
-    import subprocess
-    try:
-        mem_bytes = int(subprocess.check_output(["sysctl", "-n", "hw.memsize"]))
-        mem_gb = mem_bytes / (1024 ** 3)
-    except Exception:
-        mem_gb = 16.0
-    os_reserve = max(8.0, mem_gb * 0.25)
-    return max(4.0, mem_gb - os_reserve)
 
 
 def render_token_grid(used_pct: float, user_pct: float, assistant_pct: float, tool_pct: float, system_pct: float) -> str:
@@ -143,91 +135,10 @@ def render_token_grid(used_pct: float, user_pct: float, assistant_pct: float, to
     return "\n".join(grid)
 
 
-def estimate_parameters_from_config(cfg_dict: dict) -> Optional[float]:
-    """Estimate model parameter count in billions from its config dictionary."""
-    if "num_parameters" in cfg_dict:
-        return cfg_dict["num_parameters"] / 1e9
-
-    h = cfg_dict.get("hidden_size") or cfg_dict.get("d_model")
-    l = cfg_dict.get("num_hidden_layers") or cfg_dict.get("num_layers") or cfg_dict.get("n_layer")
-    ff = cfg_dict.get("intermediate_size") or cfg_dict.get("ffn_dim")
-    v = cfg_dict.get("vocab_size") or 32000
-
-    if not h or not l:
-        return None
-
-    if not ff:
-        ff = 4 * h
-
-    is_swiglu = cfg_dict.get("hidden_act") in ("silu", "swish") or cfg_dict.get("mlp_bias") is False
-    mlp_factor = 3 if is_swiglu else 2
-
-    attn_params = 4 * (h ** 2) * l
-    mlp_params = mlp_factor * h * ff * l
-    embed_params = v * h
-
-    total_params = attn_params + mlp_params + embed_params
-    return total_params / 1e9
 
 
-def detect_parameters_from_name(model_name: str) -> Optional[float]:
-    """Extract parameter count in billions from model name string (e.g. 'qwen-32b' -> 32.0)."""
-    import re
-    match = re.search(r'(?i)\b(\d+(?:\.\d+)?)[bm]\b', model_name)
-    if match:
-        val = float(match.group(1))
-        if 'm' in match.group(0).lower():
-            return val / 1000.0
-        return val
-    return None
 
 
-def determine_optimal_q_bits(model_path: str) -> int:
-    """Determine optimal quantization bits based on physical memory budget and model parameter count."""
-    m_avail = get_safe_memory_budget()
-
-    p = None
-    # Try local path first
-    local_path = pathlib.Path(model_path)
-    config_file = None
-    if local_path.is_dir():
-        config_file = local_path / "config.json"
-    else:
-        try:
-            from huggingface_hub import hf_hub_download
-            config_path = hf_hub_download(repo_id=model_path, filename="config.json")
-            config_file = pathlib.Path(config_path)
-        except Exception:
-            pass
-
-    if config_file and config_file.exists():
-        try:
-            with open(config_file, "r") as f:
-                cfg_dict = json.load(f)
-            p = estimate_parameters_from_config(cfg_dict)
-        except Exception:
-            pass
-
-    if p is None:
-        p = detect_parameters_from_name(model_path)
-
-    if p is None:
-        return 4
-
-    # P * Q/8 * 1.15 + 4.0 <= M_avail => Q <= (M_avail - 4.0) * 8 / (P * 1.15)
-    limit = m_avail - 4.0
-    if limit <= 0:
-        return 2
-
-    q_max = (limit * 8) / (p * 1.15)
-    if q_max >= 8.0:
-        return 8
-    elif q_max >= 4.0:
-        return 4
-    elif q_max >= 3.0:
-        return 3
-    else:
-        return 2
 
 
 def get_version() -> str:
@@ -250,102 +161,10 @@ def get_version() -> str:
         return "0.0.0+unknown"
 
 
-def runtime_python() -> str:
-    """Interpreter that hosts the MLX runtime (mlx_lm / mlx_vlm).
-
-    From source this is the current interpreter. In a PyInstaller binary
-    ``sys.executable`` is the binary itself, so resolve the managed runtime
-    venv created by ``install.sh --with-mlx`` (or ``$NOMADIC_PYTHON``).
-    """
-    override = os.environ.get("NOMADIC_PYTHON")
-    if override:
-        return override
-    if not getattr(sys, "frozen", False):
-        return sys.executable
-    home = paths.data_dir()
-    for candidate in (home / "venv" / "bin" / "python", home / "venv" / "Scripts" / "python.exe"):
-        if candidate.exists():
-            return str(candidate)
-    raise RuntimeError(
-        "MLX runtime not found. Run `install.sh --with-mlx` (Apple Silicon) "
-        "or set NOMADIC_PYTHON to a Python with mlx-lm/mlx-vlm installed."
-    )
 
 
-def run_quantization(model_path: str, q_bits: int, cache_dir: pathlib.Path) -> str:
-    """Execute mlx_lm convert / mlx_vlm.convert as a subprocess to quantize the model."""
-    import shutil
-    import subprocess
-
-    is_text = is_text_only_model(model_path)
-    module_name = "mlx_lm" if is_text else "mlx_vlm"
-
-    cmd = [
-        runtime_python(), "-m", module_name, "convert",
-        "--hf-path", model_path,
-        "-q",
-        "--q-bits", str(q_bits),
-        "-o", str(cache_dir)
-    ]
-
-    ui.rule(f"QUANTIZATION IN PROGRESS ({q_bits}-bit)")
-    ui.info(f"Source Model : {model_path}")
-    ui.info(f"Target Cache : {cache_dir}")
-    ui.info(f"Command      : {' '.join(cmd)}")
-    ui.rule()
-
-    try:
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1
-        )
-        if process.stdout:
-            for line in process.stdout:
-                print(line, end="")
-        process.wait()
-        if process.returncode != 0:
-            raise RuntimeError(f"Quantization failed with exit code {process.returncode}")
-        ui.success("Quantization completed successfully!")
-    except Exception as e:
-        if cache_dir.exists():
-            shutil.rmtree(cache_dir, ignore_errors=True)
-        raise RuntimeError(f"Quantization failed: {e}")
-    return str(cache_dir)
 
 
-def is_text_only_model(model_path: str) -> bool:
-    """Check if model is text-only (non-multimodal) based on its configuration."""
-    import json
-    import pathlib
-    model_path = normalize_model_name(model_path)
-    local_path = pathlib.Path(model_path)
-    config_file = None
-    if local_path.is_dir():
-        config_file = local_path / "config.json"
-    else:
-        try:
-            from huggingface_hub import hf_hub_download
-            config_path = hf_hub_download(repo_id=model_path, filename="config.json")
-            config_file = pathlib.Path(config_path)
-        except Exception:
-            pass
-
-    if config_file and config_file.exists():
-        try:
-            with open(config_file, "r") as f:
-                cfg = json.load(f)
-            if cfg.get("language_model_only") is True:
-                return True
-            # Check vision configuration presence in root config or text_config
-            has_vision = "vision_config" in cfg or "vision_tower" in cfg
-            if not has_vision:
-                return True
-        except Exception:
-            pass
-    return False
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1985,6 +1804,8 @@ def cmd_kernel(
         default_tool_registry=tool_registry,
         hitl_manager=hitl_manager,
         task_registry=task_registry,
+        db_conn=conn,
+        status_callback=lambda event: ui.start_status(event.message),
     )
     
     # ── Browser State & Handlers ──
@@ -2054,6 +1875,7 @@ def cmd_kernel(
             if instance.status == AgentStatus.AWAITING_REVIEW:
                 req = instance.hitl_manager.pending_reviews.get(instance.id)
                 if req:
+                    ui.stop_status()
                     prompt_text = instance.hitl_manager.format_review_prompt(req)
                     print(prompt_text)
                     user_choice = ui.prompt("HITL Choice (a/r/m/s/q)")
@@ -2072,6 +1894,19 @@ def cmd_kernel(
                     )
             else:
                 break
+    def start_background_agent(agent_id):
+        """Run an agent on its own event loop in a daemon thread (the REPL thread has no loop)."""
+        def _target():
+            try:
+                asyncio.run(orchestrator.run_agent(
+                    agent_id,
+                    lambda hist, stream=False: vlm_complete(cfg, hist, stream=stream),
+                    ui=None,
+                ))
+            except Exception:
+                pass  # failure is recorded on the agent/task by run_agent
+        threading.Thread(target=_target, name=f"nomadic-{agent_id}", daemon=True).start()
+
     try:
         chatdb.init_db(conn)
 
@@ -2101,6 +1936,7 @@ def cmd_kernel(
 
         state = _load_kernel_state(conn, session, cfg)
         task_registry.load_from_db(state.session_id)
+        orchestrator.restore_agents(state.session_id)
         chatdb.record_event(
             conn,
             state.session_id,
@@ -2188,7 +2024,7 @@ def cmd_kernel(
             # ── Built-in commands ────────────────────────────────────────────
             if submission.kind == "command":
                 parts = submission.stripped.split(maxsplit=1)
-                cmd = parts[0].lower()
+                cmd = COMMAND_ALIASES.get(parts[0].lower(), parts[0].lower())
                 rest = parts[1] if len(parts) > 1 else ""
 
                 if cmd in ("/quit", "/exit", "/q"):
@@ -2537,15 +2373,6 @@ def cmd_kernel(
                     else:
                         ui.error(f"Session not found: {rest}")
 
-                elif cmd in ("/settings", "/switch", "/undo"):
-                    # Aliases for existing commands
-                    if cmd == "/settings":
-                        ui.warn("Alias /settings mapped to /config (run /config manually for now)")
-                    elif cmd == "/switch":
-                        ui.warn("Alias /switch mapped to /resume (run /resume manually for now)")
-                    elif cmd == "/undo":
-                        ui.warn("Alias /undo mapped to /rewind (run /rewind manually for now)")
-                        
                 elif cmd == "/goal":
                     objective = rest.strip()
                     if not objective:
@@ -2667,17 +2494,41 @@ def cmd_kernel(
                             system_prompt=cfg.cot_system_prompt,
                             tool_registry=tool_registry,
                         )
-                        def run_bg():
-                            loop = asyncio.get_event_loop()
-                            loop.create_task(orchestrator.run_agent(
-                                agent_inst.id,
-                                lambda hist, stream=False: vlm_complete(cfg, hist, stream=stream),
-                                ui=None,
-                            ))
-                        run_bg()
+                        start_background_agent(agent_inst.id)
                         ui.success(f"Spawned background agent {agent_inst.id} for task: {obj}")
+                    elif subcmd == "inspect":
+                        inst = orchestrator.get_agent(subrest.strip()) if subrest else None
+                        if inst is None:
+                            ui.error("Usage: /agents inspect <agent_id> (agent not found)")
+                            continue
+                        body = [
+                            f"Agent ID  : {inst.id}",
+                            f"Status    : {inst.status.value}",
+                            f"Depth     : {inst.depth}/{inst.max_depth}",
+                            f"Task      : {inst.task.objective if inst.task else '—'}",
+                            f"Messages  : {len(inst.history)}",
+                        ]
+                        if inst.current_tool_call:
+                            body.append(f"Pending   : {inst.current_tool_call.name} {inst.current_tool_call.arguments}")
+                        if inst.result:
+                            body.append(f"Result    : {inst.result[:500]}")
+                        if inst.error:
+                            body.append(f"Error     : {inst.error}")
+                        ui.panel(f"Inspect Agent {inst.id}", "\n".join(body))
+                    elif subcmd == "handoff":
+                        parts = subrest.split(maxsplit=1)
+                        if len(parts) != 2:
+                            ui.warn("Usage: /agents handoff <from_agent_id> <sub-task objective>")
+                            continue
+                        try:
+                            child = orchestrator.handoff(parts[0], parts[1])
+                        except ValueError as exc:
+                            ui.error(str(exc))
+                            continue
+                        start_background_agent(child.id)
+                        ui.success(f"Handed off to {child.id}; running in the background.")
                     else:
-                        ui.warn("Usage: /agents [list|cancel <id>|spawn <objective>]")
+                        ui.warn("Usage: /agents [list|inspect <id>|cancel <id>|spawn <objective>|handoff <from_id> <objective>]")
 
                 elif cmd == "/tasks":
                     subparts = rest.split(maxsplit=1)
@@ -2918,7 +2769,7 @@ def cmd_kernel(
                     except Exception as e:
                         ui.error(f"Failed to fork session: {e}")
 
-                elif cmd in ("/rewind", "/undo"):
+                elif cmd == "/rewind":
                     try:
                         n = int(rest.strip()) if rest.strip() else 1
                     except ValueError:
@@ -3205,23 +3056,14 @@ Checkpoints ({len(state.checkpoints)}):
             # ── Normal user turn → VLM completion ───────────────────────────
             state.next_actions = []
             
-            resolved_msg = submission.raw
-            import re
-            attachments = []
-            for match in set(re.findall(r'(?<!\S)@([^\s]+)', submission.raw)):
-                path = match.strip()
-                p = pathlib.Path(path)
-                if p.exists() and p.is_file():
-                    try:
-                        content = p.read_text(encoding="utf-8", errors="replace")
-                        if len(content) > cfg.max_skill_chars:
-                            content = content[:cfg.max_skill_chars] + "\n\n[... truncated ...]"
-                        attachments.append(f'<file path="{path}">\n{content}\n</file>')
-                    except Exception as e:
-                        ui.warn(f"Failed to attach {path}: {e}")
-                        
-            if attachments:
-                resolved_msg += "\n\n[Attached Context:]\n" + "\n\n".join(attachments)
+            resolution = resolve_file_references(
+                submission.raw,
+                max_file_chars=cfg.max_skill_chars,
+                max_context_tokens=cfg.max_context_tokens,
+            )
+            for warning in resolution.warnings:
+                ui.warn(warning)
+            resolved_msg = resolution.append_to(submission.raw)
 
             state.add_user(resolved_msg, state.pending_image)
             state.compact_history_if_needed()
@@ -3471,22 +3313,8 @@ def main():
         parser.error(f"unrecognized arguments: {' '.join(unrecognized)}")
 
     if cfg.quantize:
-        # Resolve target q_bits
-        q_bits_str = str(cfg.q_bits).strip().lower()
-        if q_bits_str == "auto" or not q_bits_str:
-            q_bits = determine_optimal_q_bits(cfg.model)
-        else:
-            try:
-                q_bits = int(q_bits_str)
-            except ValueError:
-                q_bits = 4
-                ui.warn(f"Invalid q_bits value '{cfg.q_bits}'; defaulting to 4-bit.")
-
-        # Resolve cache dir
-        if cfg.cache_dir:
-            target_cache = pathlib.Path(cfg.cache_dir)
-        else:
-            target_cache = paths.quantized_cache_dir(cfg.model, q_bits)
+        q_bits = resolve_q_bits(cfg.q_bits, cfg.model, warn=ui.warn)
+        target_cache = cached_model_dir(cfg.model, q_bits, cfg.cache_dir)
 
         # Check if already quantized
         if pathlib.Path(cfg.model).is_dir():
@@ -3497,7 +3325,15 @@ def main():
         else:
             ui.info(f"Model {cfg.model} needs {q_bits}-bit quantization. Starting converter...")
             try:
-                run_quantization(cfg.model, q_bits, target_cache)
+                ui.rule(f"QUANTIZATION IN PROGRESS ({q_bits}-bit)")
+                ui.info(f"Source Model : {cfg.model}")
+                ui.info(f"Target Cache : {target_cache}")
+                run_quantization(
+                    cfg.model, q_bits, target_cache,
+                    status=lambda event: ui.start_status(event.message),
+                )
+                ui.stop_status()
+                ui.success("Quantization completed successfully!")
                 cfg.model = str(target_cache)
             except Exception as e:
                 ui.error(f"Failed to perform runtime quantization: {e}")

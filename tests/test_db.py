@@ -8,7 +8,7 @@ import unittest
 import uuid
 from types import SimpleNamespace
 
-from nomadic import db
+from nomadic.storage import db
 
 
 class DBConfigTests(unittest.TestCase):

@@ -18,9 +18,9 @@ from importlib.resources import files
 from typing import Any, Iterator, Mapping, Optional
 from urllib.parse import urlsplit, urlunsplit
 
-from . import paths
+from .. import paths
 
-PACKAGE_ROOT = files("nomadic")
+PACKAGE_ROOT = files("nomadic.storage")
 SQLITE_SCHEMA_RESOURCE = PACKAGE_ROOT.joinpath("sql", "sqlite_schema.sql")
 POSTGRES_SCHEMA_RESOURCE = PACKAGE_ROOT.joinpath("sql", "postgres_schema.sql")
 TASKS_SCHEMA_RESOURCE = PACKAGE_ROOT.joinpath("sql", "tasks.sql")
@@ -1181,8 +1181,84 @@ def list_tasks(
     )
 
 
+def upsert_agent_state(conn: DBConnection, state: Mapping[str, Any]) -> None:
+    """Insert or update an ``agent_states`` row from ``AgentInstance.to_state()``."""
+    now = utc_now()
+    ph = conn.placeholder
+    conn.execute(
+        f"""
+        INSERT INTO agent_states (
+            agent_id, task_id, session_id, status, depth, max_depth, system_prompt,
+            history_json, current_tool_call_json, result, error, created_at, updated_at
+        ) VALUES ({', '.join([ph] * 13)})
+        ON CONFLICT (agent_id) DO UPDATE SET
+            task_id                = excluded.task_id,
+            session_id             = excluded.session_id,
+            status                 = excluded.status,
+            depth                  = excluded.depth,
+            max_depth              = excluded.max_depth,
+            system_prompt          = excluded.system_prompt,
+            history_json           = excluded.history_json,
+            current_tool_call_json = excluded.current_tool_call_json,
+            result                 = excluded.result,
+            error                  = excluded.error,
+            updated_at             = excluded.updated_at
+        """,
+        (
+            state["agent_id"], state.get("task_id"), state.get("session_id"),
+            state.get("status", "idle"), int(state.get("depth", 0)),
+            int(state.get("max_depth", 5)), state.get("system_prompt", ""),
+            _json(state.get("history", [])) or "[]",
+            _json(state["current_tool_call"]) if state.get("current_tool_call") else None,
+            state.get("result"), state.get("error"), now, now,
+        ),
+    )
+    conn.commit()
+
+
+def _decode_agent_state(row: DBRow | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    data = dict(row)
+    data["history"] = _maybe_json(data.pop("history_json", None)) or []
+    data["current_tool_call"] = _maybe_json(data.pop("current_tool_call_json", None))
+    return data
+
+
+def get_agent_state(conn: DBConnection, agent_id: str) -> dict[str, Any] | None:
+    """Fetch one persisted agent state (history decoded), or ``None``."""
+    return _decode_agent_state(
+        _query_one(conn, f"SELECT * FROM agent_states WHERE agent_id = {conn.placeholder}", (agent_id,))
+    )
+
+
+def list_agent_states(
+    conn: DBConnection,
+    *,
+    session_id: str | None = None,
+    task_id: str | None = None,
+    status: str | None = None,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    """Return persisted agent states with optional filters, newest first."""
+    clauses: list[str] = []
+    params: list[Any] = []
+    for column, value in (("session_id", session_id), ("task_id", task_id), ("status", status)):
+        if value is not None:
+            clauses.append(f"{column} = {conn.placeholder}")
+            params.append(value)
+    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    params.append(limit)
+    rows = _query_all(
+        conn,
+        f"SELECT * FROM agent_states{where} ORDER BY updated_at DESC LIMIT {conn.placeholder}",
+        params,
+    )
+    return [_decode_agent_state(r) for r in rows if r is not None]  # type: ignore[misc]
+
+
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="db.py", description="Session database helper")
+    parser = argparse.ArgumentParser(prog="nomadic-db", description="Session database helper")
     sub = parser.add_subparsers(dest="command", required=True)
 
     init = sub.add_parser("init", help="Create or upgrade the session schema")

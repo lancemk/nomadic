@@ -254,7 +254,7 @@ class TaskRegistry:
         if self._db_conn is None:
             return
         try:
-            from . import db as chatdb
+            from .storage import db as chatdb
 
             chatdb.upsert_task(self._db_conn, task)
         except Exception:
@@ -265,7 +265,7 @@ class TaskRegistry:
         if self._db_conn is None:
             return
         try:
-            from . import db as chatdb
+            from .storage import db as chatdb
 
             rows = chatdb.list_tasks(self._db_conn, session_id=session_id)
             for row in rows:

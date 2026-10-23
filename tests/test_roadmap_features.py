@@ -4,7 +4,7 @@ import json
 import pytest
 from nomadic import agent
 from nomadic import cli
-from nomadic import db as chatdb
+from nomadic.storage import db as chatdb
 
 def test_tool_registry_dynamic_loading(tmp_path):
     # Create a dummy tool file
@@ -203,18 +203,18 @@ def test_resource_auditor_and_param_estimation():
     assert detect_parameters_from_name("no-size-here") is None
 
     # Test dynamic optimal Q-bits determination
-    import nomadic.cli
-    orig_budget = nomadic.cli.get_safe_memory_budget
+    import nomadic.quantize as qz
+    orig_budget = qz.get_safe_memory_budget
     try:
-        nomadic.cli.get_safe_memory_budget = lambda: 36.0
+        qz.get_safe_memory_budget = lambda: 36.0
         q = determine_optimal_q_bits("mlx-community/Qwen2.5-32B-Instruct")
         assert q == 4
 
-        nomadic.cli.get_safe_memory_budget = lambda: 12.0
+        qz.get_safe_memory_budget = lambda: 12.0
         q = determine_optimal_q_bits("mlx-community/Qwen2.5-32B-Instruct")
         assert q == 2
     finally:
-        nomadic.cli.get_safe_memory_budget = orig_budget
+        qz.get_safe_memory_budget = orig_budget
 
 
 def test_cli_parser_quantize_flag_and_cache(tmp_path, monkeypatch):

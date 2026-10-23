@@ -46,7 +46,7 @@ cp "${REPO_ROOT}/README.md" "${BUNDLE_ROOT}/"
 cp "${REPO_ROOT}/CHANGELOG.md" "${BUNDLE_ROOT}/"
 cp "${REPO_ROOT}/LICENSE.md" "${BUNDLE_ROOT}/"
 cp "${REPO_ROOT}/GUIDE.md" "${BUNDLE_ROOT}/docs/"
-cp "${REPO_ROOT}/nomadic/sql/"*.sql "${BUNDLE_ROOT}/sql/"
+cp "${REPO_ROOT}/nomadic/storage/sql/"*.sql "${BUNDLE_ROOT}/sql/"
 
 REQUIRE_BINARIES="${NOMADIC_REQUIRE_BINARIES:-0}"
 if python3 -c "import PyInstaller" >/dev/null 2>&1; then
@@ -57,7 +57,7 @@ if python3 -c "import PyInstaller" >/dev/null 2>&1; then
   trap 'rm -f "${STAMP}"' EXIT
   PYI_COMMON=(--onefile --clean --noconfirm
     --collect-all psycopg --collect-all psycopg_binary
-    --add-data "${REPO_ROOT}/nomadic/sql:nomadic/sql"
+    --add-data "${REPO_ROOT}/nomadic/storage/sql:nomadic/storage/sql"
     --workpath "${TMP_ROOT}/build" --distpath "${BUNDLE_ROOT}/bin" --specpath "${TMP_ROOT}")
   python3 -m PyInstaller "${PYI_COMMON[@]}" --name nomadic "${REPO_ROOT}/nomadic_bin.py"
   python3 -m PyInstaller "${PYI_COMMON[@]}" --name nomadic-db "${REPO_ROOT}/db.py"

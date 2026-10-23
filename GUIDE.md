@@ -16,7 +16,7 @@ context-window settings that now ship with the CLI.
 ## Requirements
 
 - macOS on Apple Silicon
-- Python 3
+- Python 3.12 or newer
 - `mlx-vlm`
 - `requests`
 - `rich` is optional, but makes terminal output much easier to read
@@ -298,6 +298,8 @@ Example interaction:
   server overrides.
 - `extract` still uses `--max-skill-chars`, even though it does not use the
   interactive history budget.
-- `db.py` is the backend-aware session connector and schema initializer for session data.
+- `nomadic/storage/` holds persistence: `db.py` is the backend-aware session connector and schema initializer (sessions, events, tasks, agent states); `sql/` has the SQLite/Postgres schemas. The root `db.py` is a thin wrapper for `nomadic-db`.
+- `nomadic/tools/fs.py` provides the file tools (`read_file`, `write_file`, `replace_content`, `list_dir`).
+- `nomadic/context.py` resolves `@path` references; `nomadic/quantize.py` is the runtime quantization pipeline; `nomadic/status.py` is the status event bus.
 - Intermediate tool-call JSON is handled internally; the terminal prints the
   final assistant answer plus tool progress updates.

@@ -26,7 +26,7 @@ def _normalize(text: str) -> str:
 class PackageImportTests(unittest.TestCase):
     def test_package_imports_resolve(self):
         package = importlib.import_module("nomadic")
-        db_module = importlib.import_module("nomadic.db")
+        db_module = importlib.import_module("nomadic.storage.db")
         agent_module = importlib.import_module("nomadic.agent")
 
         self.assertTrue(hasattr(package, "parse_kernel_input"))
@@ -56,7 +56,7 @@ class CLICompatibilityTests(unittest.TestCase):
 
 class SchemaParityTests(unittest.TestCase):
     def test_container_postgres_schema_matches_package_schema(self):
-        package_schema = (REPO_ROOT / "nomadic" / "sql" / "postgres_schema.sql").read_text(encoding="utf-8")
+        package_schema = (REPO_ROOT / "nomadic" / "storage" / "sql" / "postgres_schema.sql").read_text(encoding="utf-8")
         container_schema = (
             REPO_ROOT / "containers" / "postgres" / "init" / "001_nomadic_schema.sql"
         ).read_text(encoding="utf-8")
